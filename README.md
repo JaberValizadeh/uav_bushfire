@@ -59,6 +59,41 @@ step 1.
 
 ---
 
+## Requirements and install
+
+Ubuntu 20.04, **ROS Noetic** and Gazebo 11. hector_quadrotor and the packages around it are not released as Noetic debs, so the workspace is a source build:
+
+```bash
+mkdir -p ~/uav_ws/src && cd ~/uav_ws/src
+git clone https://github.com/ros-geographic-info/unique_identifier.git
+git clone https://github.com/ros-geographic-info/geographic_info.git
+git clone https://github.com/RAFALAMAO/hector-quadrotor-noetic.git
+git clone https://github.com/JaberValizadeh/uav_bushfire.git
+
+cd ~/uav_ws
+rosdep install --from-paths src --ignore-src -r -y
+catkin_make --pkg uuid_msgs unique_id geographic_msgs geodesy
+catkin_make
+```
+
+The two-stage build is not optional. `hector_pose_estimation_core` includes `geographic_msgs` headers without declaring a dependency on the target that generates them, so a single parallel build races and fails on the first pass.
+
+### Environment
+
+The commands in this README source `~/uav_ws/src/uav_pick_place/setup_uav.bash` from the author's workspace. That package is not published; if you do not have it, this is the equivalent, in every terminal:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/uav_ws/devel/setup.bash
+
+# hector's Gazebo plugins
+export GAZEBO_PLUGIN_PATH=$HOME/uav_ws/devel/lib:${GAZEBO_PLUGIN_PATH:-}
+# the quadrotor meshes, for package:// URIs in the URDF
+export GAZEBO_MODEL_PATH=$HOME/uav_ws/src/hector-quadrotor-noetic:${GAZEBO_MODEL_PATH:-}
+```
+
+---
+
 ## The scenario, and what it inverts
 
 This package began as a treasure hunt: three drones chasing gold orbs that
@@ -362,7 +397,7 @@ otherwise-identical worlds (8 → 5 contacts, 7 → 0 rescues): those numbers ar
 dominated by where fires randomly cluster, not by the world. Run 2 alone looked
 like a regression and was not.
 
-### Making it look like a place### Making it look like a place### Making it look like a place### Making it look like a place
+### Making it look like a place
 
 Every surface used to be a flat `<diffuse>` colour: eight brown cylinders with
 one green ball each, four grey-brown boxes, and Gazebo's stock grey
@@ -692,7 +727,7 @@ the natural next step.
 
 This package lives in `~/uav_ws` alongside hector and the two other UAV
 packages, so nothing extra is needed to build it. If the workspace is not built
-yet, see [uav_pick_place's README](../uav_pick_place/README.md#installing-the-dependencies)
+yet, see [Requirements and install](#requirements-and-install)
 — none of the third-party trees are packaged for Noetic and the build is
 two-stage.
 
@@ -703,8 +738,8 @@ cd ~/uav_ws && catkin_make --pkg uav_bushfire
 
 ## Related packages
 
-* [`uav_pick_place`](../uav_pick_place) — the same airframe with a gripper,
+* `uav_pick_place` — the same airframe with a gripper,
   moving blocks between pads.
-* [`uav_voice_control`](../uav_voice_control) — that mission, flown by talking
+* `uav_voice_control` — that mission, flown by talking
   to it.
 * `tb3_treasure` — the ground-robot ancestor of this package, in `~/catkin_ws`.
