@@ -1,0 +1,355 @@
+<?xml version="1.0"?>
+<!--
+  bushfire_fleet.launch
+  =====================
+  Step 2 of 3: the three aircraft and the fire ground they work.
+
+    roslaunch uav_bushfire bushfire_fleet.launch
+
+  Expects a world already running - see bushfire_world.launch. Spawns the three
+  quadrotors, their suppressors, and the fire_spotter that owns the fires, the
+  claims and the ledger.
+
+  Restartable, and that is the point of the split: changing a coalition
+  parameter costs one relaunch of this file instead of reloading Gazebo. Every
+  tuning number lives here, so a sweep needs no edit:
+
+    roslaunch uav_bushfire bushfire_fleet.launch max_crew:=2
+    roslaunch uav_bushfire bushfire_fleet.launch num_hotspots:=8
+
+  Note that the aircraft are spawned by this file, so relaunching it into a
+  world that still holds them fails the spawn with "entity already exists". The
+  models are Gazebo's, not the launch's, and outlive it. Delete them first, or
+  restart the world.
+-->
+<launch>
+
+
+  <arg name="gui"      default="true" />
+  <arg name="headless" default="false" />
+
+  <!-- RViz shows the whole incident in one view: every fire with its intensity
+       label, each aircraft, and the scan each one is steering by. Off by
+       default because Gazebo is already drawing the scene and this machine
+       would rather spend the frames on physics. -->
+  <arg name="rviz"        default="false" />
+  <arg name="rviz_config" default="$(find uav_bushfire)/rviz/bushfire.rviz" />
+
+  <arg name="world" default="$(find uav_bushfire)/worlds/bushfire.world" />
+
+  <!-- Fires burning at once. More than the fleet size on purpose: the choice
+       each drone makes is only interesting if there is more than one thing
+       worth choosing, and with three fires and three drones the answer is
+       always "take the free one". Five means a drone regularly has to weigh a
+       small fire it would own against a share of a big one. -->
+  <arg name="num_hotspots" default="7" />
+
+  <!-- Fires are lit anywhere inside +-world_half_size, and this is the number
+       the whole scenario's scale follows from.
+
+       It was 4.0, against a stand of eight trees standing in a ring around
+       it - so every fire, every transit and every bombing run happened inside
+       one 8 x 8 m square. That is a campfire with three drones over it, not a
+       bushfire operation.
+
+       At 6.0 the fire ground is 12 x 12 m, four times the area, with the
+       trees scattered across all of it rather than ringing it. Three things
+       have to move with it, and make_bushfire_world prints all three when it
+       regenerates the world:
+         - the geofence in one_uav.launch, which has to enclose it (12.8/16.0)
+         - the graded break, which rings it from 12.6 m
+         - num_hotspots, so the fires do not thin out over nine times the ground
+       -->
+  <arg name="world_half_size" default="6.0" />
+
+  <!-- Suppression: horizontal radius AND altitude ceiling, both. The drone has
+       to be over the fire and down at it.
+
+       Both are wider than a single drone needs, because a crew does not stand
+       on the fire - it stands on a ring around it, stacked in altitude. The
+       radius has to contain the ring (0.71 m for a crew of three at 1.0 m
+       separation) and the ceiling has to contain the stack (0.95 + 2 x 0.15 =
+       1.25 for the top member), both with margin, or the geometry that keeps
+       drones off each other would quietly stop them working. -->
+  <arg name="collect_dist"      default="1.00" />
+  <arg name="suppress_altitude" default="1.45" />
+  <arg name="drop_altitude"     default="0.95" />
+
+  <!-- What a fire costs, against what it is worth. Its intensity (1-10) is
+       both: it pays that many points, split equally between every drone that
+       chose it, and it takes intensity x work_per_intensity drone-seconds of
+       bombing to put out, with every crew member overhead contributing a
+       second of work per second.
+
+       That pair is the whole mechanic. Payout alone makes joining somebody
+       else's fire strictly worse than taking your own and no crew ever forms;
+       work alone makes crews free and everybody piles onto one fire. Together,
+       a drone maximises share per second - and the fire where that is best is
+       the big one, which is how big fires draw crews without anything being
+       told to make them. 1.2 puts a lone drone on a 10 for twelve seconds and
+       a crew of three on it for four. -->
+  <arg name="work_per_intensity" default="1.2" />
+
+  <!-- Most drones one fire will take. Three is the fleet: the cap is really a
+       geometric one - stations get closer as the ring fills - so raising it
+       means raising crew_separation, collect_dist and the ceiling with it. -->
+  <arg name="max_crew" default="3" />
+
+  <!-- ...and a crew closes once it is this far through the job. Equal shares
+       plus shared labour has exactly one degenerate corner: the time left in a
+       fire collapses as it finishes, so a fire at 95% looks like the best
+       thing on the board and joining it pays a full share for arriving after
+       it is over. Measured on the first run of this - a drone bombed a 7 alone
+       for fourteen seconds and was joined at 0.3 drone-seconds remaining by
+       both others, keeping 2.33 of it. Only applies to a fire that already has
+       a crew: taking over an abandoned job at 90% is fine, there is nobody to
+       take it from. -->
+  <arg name="join_deadline" default="0.7" />
+
+  <!-- Crew geometry. Neighbours on the ring are kept this far apart and each
+       member sits a step higher than the last, because two aircraft holding
+       station on the same point is a collision and with crews that is the
+       normal case rather than bad luck. -->
+  <!-- 1.30, not 1.00. Two aircraft need 0.80 m centre to centre before their
+       rotor discs even touch, so a designed separation of 1.00 left 0.20 m for
+       every bit of station-keeping error - and put the ring inside the
+       governor's own hard radius of 0.95, so the safety net was permanently
+       engaged at exactly the place the scenario wants three drones to sit. -->
+  <arg name="crew_separation"    default="1.30" />
+  <arg name="crew_altitude_step" default="0.15" />
+
+  <!-- A commitment is binding, so something has to break it when the aircraft
+       cannot honour it - stuck in a thicket, or in a respawn loop. Long on
+       purpose: this is a fault handler, not a way to change your mind. (A
+       drone that gets rescued gives its fire up itself, immediately.) -->
+  <arg name="commit_timeout" default="90.0" />
+
+  <!-- ...and not *below* this, because "under the ceiling" is also true of an
+       aircraft sitting on its landing gear. Without a floor, a fire lit near a
+       launch point is scored by a drone that has not taken off: measured, two
+       of thirty-one drops in a run were awarded at 0.18 m, four seconds before
+       anybody was airborne. -->
+  <arg name="min_drop_altitude" default="0.45" />
+
+  <!-- A suppressed fire leaves the world and the board for this long before
+       the slot lights somewhere else. Without the gap the model was moved
+       straight to its next position, so a fire never went *out* from the
+       viewer's side - it blinked from under three drones to across the arena,
+       which reads as a fire that moved rather than one that was beaten. The
+       pause is also what makes deleting and respawning the model safe rather
+       than racy; see _extinguish() in fire_spotter. -->
+  <arg name="extinguish_pause" default="1.5" />
+
+  <!-- What a fire looks like. Its intensity drives the geometry - flame
+       height, ember bed, smoke column and the radius its light throws - so a
+       10 is a bonfire that lights the trunks around it and a 1 is a smoulder.
+       flame_scale is a taste knob on top of that; fire_light is the single
+       biggest cue, because it is the only part that illuminates anything else
+       (emissive geometry lights nothing); flicker yaws the flames a few
+       degrees at this rate so they move. Turn the light off, or flicker down,
+       if the frame rate hurts on this machine. -->
+  <arg name="flame_scale" default="1.0" />
+  <arg name="fire_light"  default="true" />
+  <arg name="flicker_hz"  default="4.0" />
+
+  <!-- Where the trees are, so the spotter never lights a fire inside a trunk.
+       It cannot see them.
+
+       This was eight [x, y, 0.35] entries written out here by hand, with a
+       comment telling you to keep them in step with worlds/bushfire.world and
+       nothing checking that you had. At eight trunks that was merely fragile.
+       The fire ground is 24 x 24 m now and the stand is thirty-odd trees
+       scattered through it, so the list is GENERATED: scripts/make_bushfire_world
+       writes config/obstacles.yaml in the same pass that places the trees, and
+       this loads it. Nothing is duplicated, so nothing can drift.
+
+       Regenerate both together:
+         rosrun uav_bushfire make_bushfire_world
+
+       Three nodes read it - fire_spotter to avoid lighting inside a trunk,
+       fire_suppressor to govern its velocity near one, collision_monitor to
+       score a strike. -->
+  <arg name="obstacle_file"
+       default="$(find uav_bushfire)/config/obstacles.yaml" />
+
+  <!-- Transit altitude. Well above the suppression ceiling, because the gap
+       between the two *is* the bombing run: at 1.6 the aircraft dipped barely
+       half a metre and the drop was hard to see happening. Still well under
+       the 3 m trunks, so the drones remain inside the timber and have to go
+       round trees rather than over them. -->
+  <!-- Lane 0. The other two fly cruise_step above it, giving 1.70 / 2.15 /
+       2.60 - see lane_index in one_uav.launch. It was a single shared 2.0 m,
+       which put all three aircraft permanently inside each other's separation
+       bubble. -->
+  <arg name="cruise_altitude" default="1.70" />
+  <arg name="cruise_step" default="0.45" />
+  <arg name="linear_speed"    default="1.2" />
+  <arg name="angular_gain"    default="2.0" />
+
+  <!-- Switch from flying to station-keeping inside this, measured to the
+       drone's own station rather than to the fire. Kept tight because the
+       station is now a slot other aircraft are standing next to: arriving
+       loosely into a crew is how two of them meet. -->
+  <arg name="arrive_radius" default="0.60" />
+
+  <!-- Avoidance ranges are much wider than the TurtleBot3's 0.45/0.25: these
+       drones cruise at 1.2 m/s against its 0.3, and stopping distance is what
+       these numbers really encode. A multirotor also has to pitch back to
+       decelerate, which costs distance a differential drive does not spend. -->
+  <!-- Keeping the aircraft off each other, from known positions rather than
+       from the laser. See _peer_filter in scripts/fire_suppressor. -->
+  <arg name="rotor_radius" default="0.40" />
+  <arg name="hard_margin" default="0.15" />
+  <arg name="govern_lookahead" default="0.4" />
+  <arg name="peer_radius" default="1.20" />
+  <arg name="peer_vsep" default="0.35" />
+  <arg name="peer_push" default="0.60" />
+
+  <!-- Measures drone-drone and drone-tree separations and says which is
+       actually happening. On by default: it only subscribes. -->
+  <arg name="collide" default="true" />
+
+  <arg name="avoid_dist" default="1.6" />
+  <arg name="stop_dist"  default="0.9" />
+
+  <!-- ============================ the aircraft ==========================
+       Spread along the y axis in the clear middle of the stand, 2.2 m apart -
+       comfortably more than a rotor span, so nobody starts inside anybody. -->
+
+  <group ns="uav_0">
+    <include file="$(find uav_bushfire)/launch/one_uav.launch">
+      <arg name="ns" value="uav_0" />
+      <arg name="lane_index" value="0" />
+      <arg name="cruise_step" value="$(arg cruise_step)" />
+      <arg name="obstacle_file" value="$(arg obstacle_file)" />
+      <arg name="rotor_radius" value="$(arg rotor_radius)" />
+      <arg name="hard_margin" value="$(arg hard_margin)" />
+      <arg name="govern_lookahead" value="$(arg govern_lookahead)" />
+      <arg name="x"  value="0.0" />
+      <arg name="y"  value="0.0" />
+      <arg name="cruise_altitude" value="$(arg cruise_altitude)" />
+      <arg name="drop_altitude"   value="$(arg drop_altitude)" />
+      <arg name="linear_speed"    value="$(arg linear_speed)" />
+      <arg name="angular_gain"    value="$(arg angular_gain)" />
+      <arg name="avoid_dist"      value="$(arg avoid_dist)" />
+      <arg name="stop_dist"       value="$(arg stop_dist)" />
+      <arg name="arrive_radius"   value="$(arg arrive_radius)" />
+      <arg name="max_crew"        value="$(arg max_crew)" />
+      <arg name="join_deadline"   value="$(arg join_deadline)" />
+      <arg name="peer_radius"     value="$(arg peer_radius)" />
+      <arg name="peer_vsep"       value="$(arg peer_vsep)" />
+      <arg name="peer_push"       value="$(arg peer_push)" />
+    </include>
+  </group>
+
+  <group ns="uav_1">
+    <include file="$(find uav_bushfire)/launch/one_uav.launch">
+      <arg name="ns" value="uav_1" />
+      <arg name="lane_index" value="1" />
+      <arg name="cruise_step" value="$(arg cruise_step)" />
+      <arg name="obstacle_file" value="$(arg obstacle_file)" />
+      <arg name="rotor_radius" value="$(arg rotor_radius)" />
+      <arg name="hard_margin" value="$(arg hard_margin)" />
+      <arg name="govern_lookahead" value="$(arg govern_lookahead)" />
+      <arg name="x"  value="0.0" />
+      <arg name="y"  value="2.2" />
+      <arg name="cruise_altitude" value="$(arg cruise_altitude)" />
+      <arg name="drop_altitude"   value="$(arg drop_altitude)" />
+      <arg name="linear_speed"    value="$(arg linear_speed)" />
+      <arg name="angular_gain"    value="$(arg angular_gain)" />
+      <arg name="avoid_dist"      value="$(arg avoid_dist)" />
+      <arg name="stop_dist"       value="$(arg stop_dist)" />
+      <arg name="arrive_radius"   value="$(arg arrive_radius)" />
+      <arg name="max_crew"        value="$(arg max_crew)" />
+      <arg name="join_deadline"   value="$(arg join_deadline)" />
+      <arg name="peer_radius"     value="$(arg peer_radius)" />
+      <arg name="peer_vsep"       value="$(arg peer_vsep)" />
+      <arg name="peer_push"       value="$(arg peer_push)" />
+    </include>
+  </group>
+
+  <group ns="uav_2">
+    <include file="$(find uav_bushfire)/launch/one_uav.launch">
+      <arg name="ns" value="uav_2" />
+      <arg name="lane_index" value="2" />
+      <arg name="cruise_step" value="$(arg cruise_step)" />
+      <arg name="obstacle_file" value="$(arg obstacle_file)" />
+      <arg name="rotor_radius" value="$(arg rotor_radius)" />
+      <arg name="hard_margin" value="$(arg hard_margin)" />
+      <arg name="govern_lookahead" value="$(arg govern_lookahead)" />
+      <arg name="x"  value="0.0" />
+      <arg name="y"  value="-2.2" />
+      <arg name="cruise_altitude" value="$(arg cruise_altitude)" />
+      <arg name="drop_altitude"   value="$(arg drop_altitude)" />
+      <arg name="linear_speed"    value="$(arg linear_speed)" />
+      <arg name="angular_gain"    value="$(arg angular_gain)" />
+      <arg name="avoid_dist"      value="$(arg avoid_dist)" />
+      <arg name="stop_dist"       value="$(arg stop_dist)" />
+      <arg name="arrive_radius"   value="$(arg arrive_radius)" />
+      <arg name="max_crew"        value="$(arg max_crew)" />
+      <arg name="join_deadline"   value="$(arg join_deadline)" />
+      <arg name="peer_radius"     value="$(arg peer_radius)" />
+      <arg name="peer_vsep"       value="$(arg peer_vsep)" />
+      <arg name="peer_push"       value="$(arg peer_push)" />
+    </include>
+  </group>
+
+
+  <!-- ============================ fire ground ===========================
+       One node, no namespace. It owns the fires and keeps the ledger - who is
+       on what, how much work each fire has left, and who gets paid - but it no
+       longer assigns anything: the drones choose and claim. Held back until
+       Gazebo has the world and all three models loaded, since it spawns the
+       flames itself and meters work by drone position, so starting it into a
+       half-built simulator only produces timeouts to read. -->
+  <node pkg="uav_bushfire" type="fire_spotter" name="fire_spotter"
+        output="screen"
+        launch-prefix="bash -c 'sleep 12 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <rosparam param="drones">[uav_0, uav_1, uav_2]</rosparam>
+    <param name="num_hotspots"      value="$(arg num_hotspots)" />
+    <param name="world_half_size"   value="$(arg world_half_size)" />
+    <param name="collect_dist"      value="$(arg collect_dist)" />
+    <param name="suppress_altitude" value="$(arg suppress_altitude)" />
+    <param name="min_drop_altitude" value="$(arg min_drop_altitude)" />
+    <param name="work_per_intensity" value="$(arg work_per_intensity)" />
+    <param name="max_crew"          value="$(arg max_crew)" />
+    <param name="join_deadline"     value="$(arg join_deadline)" />
+    <param name="crew_separation"   value="$(arg crew_separation)" />
+    <param name="crew_altitude_step" value="$(arg crew_altitude_step)" />
+    <!-- Where the first crew member holds, and what the others are stacked on
+         top of. Must match the suppressor's own drop_altitude, which is what a
+         drone falls back to if it is ever sent a station-less tasking. -->
+    <param name="drop_altitude"     value="$(arg drop_altitude)" />
+    <!-- Cap on the ring radius. 0.75 keeps a full crew inside collect_dist
+         (1.00) with margin; the chord formula only reaches it past a crew of
+         four. -->
+    <param name="max_ring"          value="0.75" />
+    <param name="commit_timeout"    value="$(arg commit_timeout)" />
+    <!-- Keep fires apart. This has to clear two *crews* now, not two drones: a
+         full crew occupies a ring of up to 0.75 m plus a rotor span, so fires
+         closer than about 2 m would have their crews flying through each
+         other. It also stops a cluster inside one bombing radius letting a
+         drone work several fires from one station. -->
+    <param name="min_separation"    value="2.5" />
+    <param name="extinguish_pause"  value="$(arg extinguish_pause)" />
+    <param name="flame_scale"       value="$(arg flame_scale)" />
+    <param name="fire_light"        value="$(arg fire_light)" type="bool" />
+    <param name="flicker_hz"        value="$(arg flicker_hz)" />
+    <param name="publish_hz"        value="10.0" />
+    <!-- A slow backstop only, and it skips any fire that has a crew: moving a
+         fire with drones committed to it strands a whole coalition rather than
+         one drone. -->
+    <param name="reignite_period"   value="120.0" />
+    <param name="obstacle_clearance" value="0.8" />
+    <rosparam file="$(arg obstacle_file)" command="load" />
+  </node>
+
+  <node if="$(arg collide)" pkg="uav_bushfire" type="collision_monitor"
+        name="collision_monitor" output="screen">
+    <rosparam file="$(arg obstacle_file)" command="load" />
+    <param name="rotor_radius" value="0.40" />
+    <param name="drone_vsep"   value="0.30" />
+    <param name="tree_height"  value="3.00" />
+  </node>
+
+</launch>

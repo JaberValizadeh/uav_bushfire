@@ -1,0 +1,1148 @@
+#!/usr/bin/env python3
+"""
+make_bushfire_world - generate the fire ground.
+
+Writes worlds/bushfire.world: a stand of dry eucalypt inside a bulldozed
+firebreak, for three quadrotors to water-bomb ground fires in.
+
+What was here before, and why it needed replacing
+-------------------------------------------------
+Eight brown cylinders, each with one green ball balanced on top. Four flat
+grey-brown boxes walling the whole thing in. Gazebo's stock grey chequerboard
+underneath all of it, running to the horizon. One sun, shadows off, every
+surface a flat <diffuse> colour.
+
+That is a diagram of a fire ground. It reads as one from the first frame, and
+the giveaway is not any single object - it is that every object is exactly one
+primitive, so the eye gets no silhouette to work with and no surface detail to
+land on. Both are cheap to fix and neither costs anything at run time.
+
+The walls were the other half of it, and they are gone. A 12 m box with trees
+in it reads as a room from every angle, and they were not earning it: the
+containment in this scenario is fire_suppressor's geofence, which teleports a
+lost aircraft back to its launch point, and the suppressor's own header records
+a drone going OVER a wall at 3.5 m and still accelerating 275 m away. A
+geofence cannot be flown over. What stands in their place is what would really
+be there - the graded break, and unburnt bush past it.
+
+The four constraints this generator is not allowed to break
+------------------------------------------------------------
+This world is not scenery, it is the obstacle field for a reactive laser
+avoidance scenario, and almost everything interesting about the package is
+downstream of its geometry. Four things are load-bearing:
+
+  1. THE TRUNKS ARE THE OBSTACLE LIST. bushfire_fleet.launch hardcodes eight
+     [x, y, 0.35] entries, and three separate nodes read them: fire_spotter to
+     avoid lighting a fire inside a trunk it cannot see, fire_suppressor to
+     govern its velocity near one, collision_monitor to score a strike. So
+     every trunk keeps its exact position and a collision cylinder of exactly
+     radius 0.35 and height 3.0. The generator prints the list it just built
+     so it can be checked against the launch file, and refuses to write a
+     world whose trunks have moved.
+
+  2. ONLY TRUNKS COLLIDE. The laser is a horizontal plane on a mast: it sees
+     trunks perfectly and cannot see one thing above or below itself. Any
+     collision geometry the laser cannot return is an obstacle the aircraft
+     can hit and has no sensor capable of detecting - the one scene the
+     controller's own header says it cannot handle. So the canopies, the
+     branches, the logs, the stumps, the rocks and the bund's earth bank are
+     all VISUAL ONLY. The aircraft only ever collides with something it could
+     have seen coming. This is the same rule the old world followed for its
+     canopy spheres; there is just a great deal more world obeying it now.
+
+  3. NOTHING THE AIRCRAFT CAN REACH IS UNSCORED. With the walls gone, the
+     only containment is fire_suppressor's geofence: soft at 4.8 m, hard at
+     8.0 m where the aircraft is respawned at its launch point. The trunks in
+     the surrounding bush DO collide, because they are laser-visible and
+     making them ghosts would be the dishonest option - but they are not in
+     ~obstacles, so collision_monitor does not score them. They therefore have
+     to sit outside the hard geofence, where no aircraft can arrive. They were
+     first placed at 7.2 m, inside the 4.8-to-8.0 band a soft-fenced drone
+     genuinely reaches, and a run put uav_1 at (-8.0, -1.8) straight through
+     them. BUSH_IN is 8.8 and main() refuses to write anything closer.
+
+  4. NOTHING NEW GOES IN THE FIRE ZONE. fire_spotter lights fires anywhere in
+     +-world_half_size (4.0 m), avoiding trunks. Ground furniture is therefore
+     placed OUTSIDE 4.0 m, in the band between the timber and the bund, so a
+     fire can never be lit inside a log. The alternative - adding the logs to
+     ~obstacles - looks equivalent and is not: fire_suppressor's governor
+     treats every entry as a full-height keep-out cylinder with no notion of z,
+     so a 0.4 m log would push aircraft off course at cruise altitude for
+     something they fly over. Placement solves it for free; the obstacle list
+     is for things that are genuinely 3 m tall.
+
+Building a tree out of primitives
+---------------------------------
+There is no model database on this machine and no tree meshes in the
+workspace, so a eucalypt here is cylinders and spheres. Four things stop it
+reading as a lollipop on a stick:
+
+  a tapered trunk    three stacked cylinders of decreasing radius with a slight
+                     lean, not one straight tube. THREE, and the count went the
+                     opposite way to intuition - it was tried at eight for a
+                     finer taper and came out much worse, because every segment
+                     boundary restarts the texture and eight of them read as
+                     stacked pipe. Seam count matters more than step size. The
+                     taper is inward only and the lean is under 0.05 m over
+                     3 m, because the collision cylinder does not lean and the
+                     visual has to stay inside it, or the aircraft appears to
+                     stop a hand's width short of the bark.
+  a charred butt     the bottom segment carries fire-scarred bark. Eucalypt
+                     forest burns regularly and the trees show it; a stand of
+                     clean trunks says this is a park someone dropped a match
+                     in.
+  real branches      four to six angled limbs from the crown of the trunk, at
+                     irregular bearings, plus the odd dead spar. They start at
+                     2.4 m and climb, which keeps them clear of the highest
+                     cruise lane at 2.60 m.
+  a layered canopy   twenty-six to thirty-eight SMALL overlapping spheres, not
+                     a dozen big ones. This is the difference between a tree
+                     and a head of broccoli: a 0.55 m sphere is smoothly shaded
+                     over a span the eye takes in whole, so it stays a ball
+                     however good the texture on it is. At 0.3 m and thirty of
+                     them the silhouette is all edges, and the dark holes in
+                     the foliage texture line up across neighbours into gaps
+                     you can see sky through. A eucalypt crown is open rather
+                     than dense, so they are placed wider than an orchard's.
+
+Usage
+-----
+  rosrun uav_bushfire make_bushfire_textures    # the tiling textures, first
+  rosrun uav_bushfire make_bushfire_world
+  rosrun uav_bushfire make_bushfire_world --seed 3 --shadows
+"""
+
+import argparse
+import math
+import os
+import random
+import re
+
+# ----------------------------------------------------------- the invariants --
+#
+# These are checked, not assumed. See constraint 1 above.
+
+TRUNK_R = 0.35              # must match the radius in the obstacle list
+TRUNK_H = 3.0               # must match ~tree_height in collision_monitor
+
+# ---------------------------------------------------------------- the size --
+#
+# FIRE_HALF is the number everything else here follows from. It is
+# ~world_half_size in bushfire_fleet.launch - the half-width of the square
+# fire_spotter lights fires in - and it used to be 4.0 m against a stand of
+# eight trees in a ring, which made the whole operation happen inside a 8 x 8 m
+# square. That is not a bushfire, it is a campfire with three drones over it.
+#
+# At 6.0 the fire ground is 12 x 12 m - four times the area it started at, with
+# the trees spread across all of it instead of standing in a ring around the
+# edge of it. Everything below scales off this: the geofence that has to
+# enclose it, the graded break that rings it, the standing bush that has to
+# stay outside the geofence, and how many trees fill it at a flyable density.
+#
+# This is the ONE number to change to resize the fire ground. Change it and
+# regenerate; the generator prints the launch arguments that go with whatever
+# it wrote, and refuses to write a world whose bush or geofence no longer make
+# sense against it.
+FIRE_HALF = 6.0
+
+# m2 per tree. Tightened from 20 when the ground came down to 12 x 12: density
+# is what makes a stand read as a stand, and 20 m2 each put nine trees in the
+# whole fire ground, which is a paddock with some trees in it. The floor on
+# this is flyability, not looks - the placer keeps trunks 2.6 m apart, which
+# leaves 1.9 m of clear air between two trunk surfaces against a 0.8 m rotor
+# span, and the aircraft has to thread that at 1.2 m/s.
+TREE_DENSITY = 12.0
+
+LAUNCH = [(0.0, 0.0), (0.0, 2.2), (0.0, -2.2)]
+LAUNCH_CLEAR = 1.6          # keep trees and furniture off the launch points
+
+# The geofence, which is the only containment there is. Soft turns the drone
+# round, hard teleports it back to its launch point. Both live in
+# one_uav.launch; they are repeated here because the standing bush has to be
+# placed outside the hard limit and the generator refuses to write it closer.
+FENCE_SOFT = FIRE_HALF + 0.8        # 12.8
+FENCE_HARD = FENCE_SOFT + 3.2       # 16.0
+
+# The graded break rings the fire ground, just outside the last place a fire
+# can be lit. That is what a firebreak is - the ground where the fuel has been
+# taken off, at the edge of the burn - and at the old size it sat at 4.6 m,
+# which was inside the operating area once that grew.
+BREAK_IN = FIRE_HALF + 0.6          # 12.6
+BREAK_OUT = BREAK_IN + 2.0          # 14.6
+
+# Logs, stumps and rocks go in the break band, the way a dozer windrows what it
+# clears - and at the foot of trees, where fallen limbs actually collect. Both
+# are places a fire provably cannot be lit: the band is outside FIRE_HALF, and
+# a tree butt is inside the exclusion disc fire_spotter already keeps clear of
+# every trunk. See furniture() and _fire_safe().
+FURN_IN = BREAK_IN + 0.35
+FURN_OUT = BREAK_OUT - 0.25
+
+# Unburnt bush beyond the break. It starts outside the HARD geofence, and that
+# is load-bearing rather than aesthetic: those trunks collide (they are
+# laser-visible, so ghosts would be the dishonest option) but they are NOT in
+# the obstacle list, so collision_monitor does not score them. They therefore
+# have to sit where no aircraft can arrive. An earlier version had them inside
+# that band and a run put uav_1 straight through them.
+BUSH_IN = FENCE_HARD + 0.8          # 16.8
+BUSH_OUT = BUSH_IN + 9.5
+
+CRUISE_TOP = 2.60           # highest lane; branches stay above this
+CANOPY_FLOOR = 2.30         # lowest a crown may hang, as in the old world
+
+GROUND = 90.0               # the grass box, big enough to be the horizon
+
+# ------------------------------------------------------------------- pieces --
+
+def _smat(name):
+    """A textured material, by name."""
+    return ('<material><script>'
+            '<uri>model://bushfire/materials/scripts</uri>'
+            '<uri>model://bushfire/materials/textures</uri>'
+            '<name>%s</name></script></material>' % name)
+
+
+def _mat(rgb, alpha=1.0):
+    r, g, b = rgb
+    return ('<material><ambient>%.3f %.3f %.3f %.2f</ambient>'
+            '<diffuse>%.3f %.3f %.3f %.2f</diffuse></material>'
+            % (r * 0.42, g * 0.42, b * 0.42, alpha, r, g, b, alpha))
+
+
+def _cyl(r, ln):
+    return '<cylinder><radius>%.4f</radius><length>%.4f</length></cylinder>' % (r, ln)
+
+
+def _box(sx, sy, sz):
+    return '<box><size>%.4f %.4f %.4f</size></box>' % (sx, sy, sz)
+
+
+def _sphere(r):
+    return '<sphere><radius>%.4f</radius></sphere>' % r
+
+
+def _link(name, pose, geom, material, collide=False):
+    col = ('      <collision name="%s_c"><geometry>%s</geometry></collision>\n'
+           % (name, geom)) if collide else ''
+    return ('    <link name="%s">\n      <pose>%s</pose>\n%s'
+            '      <visual name="%s_v"><geometry>%s</geometry>%s</visual>\n'
+            '    </link>\n' % (name, pose, col, name, geom, material))
+
+
+def _model(tag, links):
+    return ('  <model name="%s">\n    <static>true</static>\n%s  </model>\n'
+            % (tag, ''.join(links)))
+
+
+# -------------------------------------------------------------------- trees --
+
+def stand_positions(rng):
+    """Where the trees go.
+
+    The stand used to be eight trunks at fixed coordinates, hardcoded here AND
+    in bushfire_fleet.launch, with a comment in each telling you to keep them
+    in step by hand. At eight that was merely fragile. Spread across a 24 x 24
+    fire ground there are about thirty of them and hand-maintenance is not an
+    option, so the list is generated here and written to config/obstacles.yaml
+    for the launch to load. Nothing is duplicated and nothing can drift.
+
+    Dart-throwing with a minimum separation rather than a grid: a grid of
+    trunks reads as an orchard, and worse, it gives the aircraft clean lanes to
+    fly down. The point of this scenario is threading a stand.
+
+    Two rules on placement. Nothing within LAUNCH_CLEAR of a launch point,
+    because three aircraft take off from there. And the stand runs slightly
+    PAST FIRE_HALF, so the trees do not stop exactly where the fires do - a
+    treeline that ends on the same square the fires end on looks drawn rather
+    than grown.
+    """
+    reach = FIRE_HALF + 0.9
+    target = int((2 * reach) ** 2 / TREE_DENSITY)
+    sep = 2.6
+    pts = []
+    tries = 0
+    while len(pts) < target and tries < target * 300:
+        tries += 1
+        x = rng.uniform(-reach, reach)
+        y = rng.uniform(-reach, reach)
+        if any(math.hypot(x - lx, y - ly) < LAUNCH_CLEAR + TRUNK_R
+               for lx, ly in LAUNCH):
+            continue
+        if any(math.hypot(x - px, y - py) < sep for px, py in pts):
+            continue
+        pts.append((round(x, 3), round(y, 3)))
+    return pts
+
+
+def _clear_of_trunks(x, y, trees):
+    """Is this spot clear of every trunk, so furniture does not grow out of one?
+
+    This USED to be a much stronger test called _fire_safe, which required
+    every piece of ground furniture to sit somewhere fire_spotter could never
+    light a fire: outside FIRE_HALF, or inside the exclusion disc the spotter
+    already keeps round each trunk. The rule is gone, deliberately, and the
+    reasoning is worth keeping because it changed twice.
+
+    It was written when the fire ground was 8 x 8 m and the furniture was a
+    windrow round the edge of it. The stated purpose was that a fire could
+    never be lit inside a log. On a 24 x 24 m ground it fails on both counts.
+    Geometrically it cannot hold: a 2 m log at a tree butt necessarily reaches
+    past a 1.15 m exclusion disc, so the only way to satisfy it is to banish
+    every log to the perimeter again - which is the arrangement it was
+    introduced to avoid. And it was never protecting anything: furniture has
+    NO COLLISION, so a fire on a log is not a physics problem, an aircraft
+    problem or a sensor problem. It is a picture of a log burning in a
+    bushfire, which is what the scenario is about.
+
+    What is left is the part that was always real: furniture must not grow out
+    of a trunk, because a trunk IS collision geometry and a log sprouting from
+    one looks like a bug. The invariants that matter are untouched - nothing
+    hittable the laser cannot see, nothing unscored the aircraft can reach.
+    """
+    return not any(math.hypot(x - tx, y - ty) < 0.62 for tx, ty in trees)
+
+
+OBSTACLE_CLEARANCE = 0.8    # bushfire_fleet.launch ~obstacle_clearance
+
+
+BARK_MATS = ('Bushfire/BarkStringy', 'Bushfire/BarkSmooth')
+FOLIAGE_MATS = ('Bushfire/Foliage0', 'Bushfire/Foliage1', 'Bushfire/Foliage2')
+
+
+class Tree(object):
+    """One eucalypt: many visuals, exactly one collision cylinder.
+
+    The collision is written first and never varies. Everything after it is
+    appearance, and none of it can be hit - see constraint 2 at the top.
+    """
+
+    def __init__(self, rng, tag, x, y, detail=True):
+        self.tag = tag
+        self.x, self.y = x, y
+        self.links = []
+        bark = rng.choice(BARK_MATS)
+
+        # ---- the one thing physics and the laser know about ---------------
+        # Dead centre, dead straight, radius 0.35, 3 m. Not negotiable: this
+        # is the entry in ~obstacles that three other nodes are working from.
+        self.links.append(
+            '    <link name="trunk">\n'
+            '      <pose>0 0 %.4f 0 0 0</pose>\n'
+            '      <collision name="trunk_c"><geometry>%s</geometry></collision>\n'
+            '    </link>\n' % (TRUNK_H / 2.0, _cyl(TRUNK_R, TRUNK_H)))
+
+        # ---- the trunk you can see ----------------------------------------
+        # Four segments, tapering inward from just under the collision radius.
+        # The lean is deliberately tiny. A real trunk leans and the eye knows
+        # it, but the collision cylinder does not lean, and a visual that
+        # wandered outside it would have the aircraft stopping in mid air a
+        # hand's width short of the bark - which looks like a bug in the
+        # avoidance rather than like a tree.
+        lean_b = rng.uniform(0, 2 * math.pi)
+        lean_r = rng.uniform(0.02, 0.045)          # metres, over the full 3 m
+        # THREE segments, and the count went the opposite way to what you
+        # would expect. It was four, then eight, on the theory that a finer
+        # taper reads as smoother - and eight was much worse, because every
+        # segment boundary is a seam whether the radius steps there or not.
+        # Each cylinder is a separate visual with its own UV mapping, so the
+        # texture restarts at every joint, and eight of those up a 3 m trunk
+        # came out as stacked pipe sections. The seam count is what matters,
+        # not the step size, so the answer is as few segments as will still
+        # show a taper: butt, body, head.
+        spans = ((0.00, 0.62, 0.985), (0.62, 1.92, 0.90), (1.92, 3.00, 0.72))
+        for i, (z0, z1, rf) in enumerate(spans):
+            r = TRUNK_R * rf
+            z = (z0 + z1) / 2.0
+            f = z / TRUNK_H
+            off = lean_r * (f ** 1.4)
+            # The butt is char and nothing else is. Fire country: the trees
+            # have been through this before.
+            mat = _smat('Bushfire/CharBark' if i == 0 else bark)
+            self.links.append(_link(
+                'trunk_v%d' % i,
+                '%.4f %.4f %.4f 0 0 0' % (off * math.cos(lean_b),
+                                          off * math.sin(lean_b), z),
+                _cyl(r, (z1 - z0) * 1.04), mat))
+
+        # A buttressed root flare, which is most of what stops a cylinder
+        # reading as a pipe pushed into the dirt.
+        for k in range(rng.randint(3, 5) if detail else 0):
+            b = rng.uniform(0, 2 * math.pi)
+            self.links.append(_link(
+                'root%d' % k,
+                '%.4f %.4f 0.09 0 %.3f %.3f'
+                % (0.24 * math.cos(b), 0.24 * math.sin(b), 1.15, b),
+                _cyl(rng.uniform(0.055, 0.085), 0.42),
+                _smat('Bushfire/CharBark')))
+
+        # ---- branches ------------------------------------------------------
+        # From 2.4 m and climbing, so they clear the top cruise lane at 2.60.
+        crown = []
+        n_br = rng.randint(4, 6) if detail else rng.randint(3, 4)
+        b0 = rng.uniform(0, 2 * math.pi)
+        for k in range(n_br):
+            b = b0 + 2 * math.pi * k / n_br + rng.uniform(-0.35, 0.35)
+            z0 = rng.uniform(2.40, 2.85)
+            ln = rng.uniform(0.55, 0.95)
+            el = rng.uniform(0.55, 1.05)           # radians above horizontal
+            mx = 0.5 * ln * math.cos(el) * math.cos(b)
+            my = 0.5 * ln * math.cos(el) * math.sin(b)
+            mz = z0 + 0.5 * ln * math.sin(el)
+            self.links.append(_link(
+                'branch%d' % k,
+                '%.4f %.4f %.4f 0 %.4f %.4f' % (mx, my, mz,
+                                                math.pi / 2 - el, b),
+                _cyl(rng.uniform(0.030, 0.055), ln), _smat(bark)))
+            crown.append((mx * 1.9, my * 1.9, z0 + ln * math.sin(el) + 0.20))
+
+        # One tree in three keeps a dead spar - a bare limb sticking out of the
+        # crown. Eucalypts drop limbs and the stand should show it.
+        if detail and rng.random() < 0.34:
+            b = rng.uniform(0, 2 * math.pi)
+            self.links.append(_link(
+                'spar',
+                '%.4f %.4f %.4f 0 %.4f %.4f'
+                % (0.42 * math.cos(b), 0.42 * math.sin(b), 3.05,
+                   math.pi / 2 - 0.35, b),
+                _cyl(0.038, 1.15), _smat('Bushfire/CharBark')))
+
+        # ---- canopy --------------------------------------------------------
+        # No collision, ever. Clustered on the branch ends rather than centred
+        # on the trunk, and sparser than an orchard canopy because a eucalypt
+        # crown is open - you see sky through it.
+        # Many small spheres, not a few big ones. This is the difference
+        # between a tree and a head of broccoli and it was worth a rebuild to
+        # get right: a 0.55 m sphere is smoothly shaded over a span the eye can
+        # take in whole, so it stays a ball however good the texture on it is.
+        # At 0.30 m and thirty of them the silhouette is all edges, no single
+        # sphere is large enough to read as a solid, and the texture's dark
+        # holes line up across neighbours into gaps you can see sky through.
+        n_fol = rng.randint(26, 38) if detail else rng.randint(11, 16)
+        base_r = rng.uniform(0.24, 0.34) if detail else rng.uniform(0.34, 0.46)
+        for k in range(n_fol):
+            cx, cy, cz = crown[k % len(crown)] if crown else (0, 0, 3.2)
+            # Spread along the branch as well as around its end, so the crown
+            # follows the limbs rather than sitting on them as a cap.
+            t = rng.uniform(0.35, 1.25)
+            fx = cx * t + rng.uniform(-0.34, 0.34)
+            fy = cy * t + rng.uniform(-0.34, 0.34)
+            fr = base_r * rng.uniform(0.55, 1.35)
+            fz = cz + rng.uniform(-0.34, 0.72)
+            # Nothing hangs lower than the old world's canopies did.
+            fz = max(fz, CANOPY_FLOOR + fr)
+            self.links.append(_link(
+                'foliage%d' % k, '%.4f %.4f %.4f 0 0 0' % (fx, fy, fz),
+                _sphere(fr), _smat(rng.choice(FOLIAGE_MATS))))
+        self.lowest_canopy = CANOPY_FLOOR
+
+    def model(self):
+        return ('  <model name="%s">\n    <static>true</static>\n    '
+                '<pose>%.4f %.4f 0 0 0 0</pose>\n%s  </model>\n'
+                % (self.tag, self.x, self.y, ''.join(self.links)))
+
+
+# ------------------------------------------------------------------ surfaces --
+
+def ground():
+    """Cured grass, and the collision floor.
+
+    The stock model://ground_plane is gone. Its grey chequerboard is the most
+    recognisable thing in any generated Gazebo world, and laying a box over the
+    middle only hid the middle - the squares still ran to the horizon in every
+    wide shot. So this box is large enough to *be* the horizon and carries the
+    collision itself.
+
+    Top face at exactly z = 0, which is where ground_plane's was, so nothing
+    about takeoff, the drop altitude or the landing changes.
+    """
+    return _model('ground_cover', [
+        _link('grass', '0 0 -0.01 0 0 0', _box(GROUND, GROUND, 0.02),
+              _smat('Bushfire/DryGrass'), collide=True)])
+
+
+def firebreak_floor():
+    """The graded break: bare mineral earth round the stand.
+
+    This is the actual firebreak, and with the walls gone it is the only thing
+    marking the edge of the fire ground - which is correct, because a firebreak
+    is not a barrier, it is the *absence of fuel*. A dozer has taken the grass,
+    the litter and the topsoil off a ring of ground, and that ring is what
+    stops a fire leaving.
+
+    It sits from BREAK_IN to BREAK_OUT, entirely outside the 4.0 m the spotter
+    lights fires in, so it is ground no fire is ever lit on. That is the point
+    of it and it is also why nothing else is placed on it.
+    """
+    links = []
+    mid = (BREAK_IN + BREAK_OUT) / 2.0
+    wide = BREAK_OUT - BREAK_IN
+    for tag, pose, geom in (
+            ('n', '0 %.3f 0.003 0 0 0' % mid,
+             _box(2 * BREAK_OUT, wide, 0.004)),
+            ('s', '0 %.3f 0.003 0 0 0' % -mid,
+             _box(2 * BREAK_OUT, wide, 0.004)),
+            ('e', '%.3f 0 0.003 0 0 0' % mid,
+             _box(wide, 2 * BREAK_IN, 0.004)),
+            ('w', '%.3f 0 0.003 0 0 0' % -mid,
+             _box(wide, 2 * BREAK_IN, 0.004))):
+        links.append(_link('break_' + tag, pose, geom,
+                           _smat('Bushfire/MineralEarth')))
+    return _model('firebreak_floor', links)
+
+
+def burn_scars(rng, trees):
+    """Ground that has been through it before.
+
+    Two earlier versions were wrong in opposite directions. The first put a
+    disc round the butt of every tree, and eight grey circles on open ground
+    read as concrete pads - a hard circular edge is not something fire makes,
+    and repeating it once per tree turned it into a pattern. The second banned
+    them from the fire zone entirely, on the grounds that a fire lit on a scar
+    would bury its own scorch disc; with the fire ground at 8 x 8 m that left
+    them ringing the break, where they read as paving slabs laid along a path.
+
+    Neither survives a 24 x 24 m fire ground. Old burns belong ALL OVER a fire
+    ground - that is what makes it a fire ground rather than a paddock - and
+    the scorch-disc worry is not worth the cost: a flame seated on burnt earth
+    loses a dark ring against dark ground, which is a detail nobody can see,
+    against an interior that otherwise has no history in it at all.
+
+    Irregular quads at irregular angles, in groups that share a bearing,
+    because a burn runs with the wind and its edge is the line where it stopped.
+    """
+    links = []
+    n = 0
+    groups = int((2 * BREAK_OUT) ** 2 / 90.0)
+    for k in range(groups):
+        b = rng.uniform(0, 2 * math.pi)
+        d = rng.uniform(1.5, BUSH_IN - 1.5)
+        cx, cy = d * math.cos(b), d * math.sin(b)
+        run = rng.uniform(0, math.pi)
+        for j in range(rng.randint(2, 5)):
+            links.append(_link(
+                'burn%d' % n,
+                '%.4f %.4f 0.002 0 0 %.3f'
+                % (cx + rng.uniform(-1.3, 1.3), cy + rng.uniform(-1.3, 1.3),
+                   run + rng.uniform(-0.35, 0.35)),
+                _box(rng.uniform(1.4, 3.4), rng.uniform(0.8, 2.0), 0.003),
+                _smat('Bushfire/BurntGround')))
+            n += 1
+    return _model('burn_scars', links)
+
+
+def surrounds(rng):
+    """The standing bush on the far side of the break.
+
+    This is what the four walls were really for - closing the scene - and it
+    does the job properly, because an open forest thinning into the distance is
+    what a fire ground actually sits in. Two rings of it: full trees near the
+    break, then smaller and denser scrub further out to carry the eye to the
+    haze.
+
+    These trunks DO collide, and that is the consistent choice rather than the
+    cautious one. The rule in this world is that nothing is hittable which the
+    laser cannot see, not that nothing is hittable at all - and a 3 m trunk at
+    mast height is the one thing the laser sees perfectly. Leaving them
+    ghostly would be the dishonest option: an aircraft that wandered out here
+    would fly through a tree its own sensor was reporting.
+
+    They are deliberately NOT added to ~obstacles in bushfire_fleet.launch.
+    That list is read by fire_spotter, which only lights fires inside 4.0 m,
+    and by fire_suppressor's governor, which would treat thirty more entries
+    as thirty more keep-out cylinders to steer around on every transit. The
+    laser is the sensor for these; the list is for the eight trees the aircraft
+    actually has to thread.
+    """
+    out = []
+    n = 0
+    placed = 0
+    tries = 0
+    while placed < 34 and tries < 3000:
+        tries += 1
+        b = rng.uniform(0, 2 * math.pi)
+        d = rng.uniform(BUSH_IN, BUSH_OUT)
+        x, y = d * math.cos(b), d * math.sin(b)
+        if max(abs(x), abs(y)) < BUSH_IN:
+            continue                       # keep the break clear
+        if any(math.hypot(x - ox, y - oy) < 1.9 for ox, oy, _ in
+               [(m[0], m[1], 0) for m in _placed_bush]):
+            continue
+        _placed_bush.append((x, y))
+        t = Tree(rng, 'bush_%d' % n, x, y, detail=False)
+        out.append(t.model())
+        n += 1
+        placed += 1
+
+    # Scrub: low, dense, visual only, filling the gaps between the trunks so
+    # the stand does not read as poles on a lawn.
+    links = []
+    k = 0
+    for _ in range(90):
+        b = rng.uniform(0, 2 * math.pi)
+        d = rng.uniform(BUSH_IN - 0.3, BUSH_OUT + 4.0)
+        x, y = d * math.cos(b), d * math.sin(b)
+        if max(abs(x), abs(y)) < BUSH_IN - 0.3:
+            continue
+        cx, cy = x, y
+        # Smaller and more numerous than the first pass. A 0.5 m sphere
+        # near the camera is a smooth ball however good the texture is; the
+        # only thing that hides a sphere is another sphere overlapping it.
+        h = rng.uniform(0.45, 1.25)
+        for j in range(rng.randint(5, 9)):
+            r = rng.uniform(0.14, 0.30)
+            links.append(_link(
+                'scrub%d_%d' % (k, j),
+                '%.4f %.4f %.4f 0 0 0'
+                % (cx + rng.uniform(-0.5, 0.5), cy + rng.uniform(-0.5, 0.5),
+                   h * rng.uniform(0.5, 1.1)),
+                _sphere(r), _smat(rng.choice(FOLIAGE_MATS))))
+        k += 1
+    out.append(_model('scrub', links))
+    return out
+
+
+_placed_bush = []
+
+
+def _furn_spot(rng, trees):
+    """A candidate spot for a log, a stump or a rock.
+
+    Two thirds of the time at the foot of a tree, a third out in the windrow
+    along the break. Both are fire-free by construction; the mix is what stops
+    all the debris in a 24 x 24 m stand ending up in a ring round the edge of
+    it, which is where the whole lot went when the break band was the only
+    legal ground.
+    """
+    if trees and rng.random() < 0.72:
+        tx, ty = trees[rng.randrange(len(trees))]
+        b = rng.uniform(0, 2 * math.pi)
+        d = rng.uniform(0.75, 3.4)      # anywhere near the tree, not just its disc
+        return tx + d * math.cos(b), ty + d * math.sin(b)
+
+    # The windrow follows a SQUARE ring, because the fire zone is a square.
+    # It was a circle of radius FURN_IN, and the generator's own check caught
+    # what that means: a circle of radius 12.95 is outside +-12 near the axes
+    # and INSIDE it near the diagonals, where both coordinates are only 9.2.
+    # The first log it placed landed at (6.94, -11.97) - legal on the circle,
+    # squarely inside the square. The break itself is drawn as a square ring,
+    # so this now matches the thing it is supposed to lie along.
+    d = rng.uniform(FURN_IN, FURN_OUT)
+    t = rng.uniform(-d, d)
+    side = rng.randrange(4)
+    return ((t, d), (t, -d), (d, t), (-d, t))[side]
+
+
+def furniture(rng, trees):
+    """Logs, stumps, rocks and tussocks - all visual, all outside the fires.
+
+    Everything here lives in the band between 4.3 m and the break. See
+    constraint 4: outside FIRE_HALF nothing can ever be lit inside it, which
+    is a stronger guarantee than any clearance check, and it costs nothing
+    because that band was empty anyway.
+    """
+    out = []
+    n = 0
+
+    # The check is on the CLUSTER BASE, so the band has to allow for how far
+    # a link can sit from it: a rock cluster scatters stones +-0.40 m and a log
+    # puts its broken end 0.4 * length away. Placing the base at 4.30 let a
+    # stone land at 3.82 - inside the 4.0 m the spotter lights fires in, which
+    # is constraint 4 broken by exactly the margin that was not accounted for.
+    # FURN_IN carries that margin, and main() checks the finished world rather
+    # than trusting this.
+    def clear(x, y, reach=0.0):
+        # `reach` is how far this item's own links extend from (x, y). Judging
+        # an object by its centre is what let a log's far end grow out of a
+        # trunk while its middle sat in clear ground - the generator's output
+        # check caught it, and this is where the fix belongs.
+        if any(math.hypot(x - tx, y - ty) < 0.62 + reach for tx, ty in trees):
+            return False
+        for lx, ly in LAUNCH:
+            if math.hypot(x - lx, y - ly) < LAUNCH_CLEAR + reach:
+                return False
+        return max(abs(x), abs(y)) + reach < FURN_OUT
+
+    # Fallen timber. A eucalypt stand is full of it and it is the single most
+    # effective piece of ground furniture, because a long horizontal thing
+    # among vertical ones is what breaks up a field of trunks.
+    placed = 0
+    tries = 0
+    while placed < 22 and tries < 3000:
+        tries += 1
+        ln = rng.uniform(1.1, 2.1)
+        r = rng.uniform(0.11, 0.19)
+        yaw = rng.uniform(0, math.pi)
+        x, y = _furn_spot(rng, trees)
+        if not clear(x, y, 0.5 * ln + r):
+            continue
+        links = [_link('log', '%.4f %.4f %.4f 0 1.5708 %.4f' % (x, y, r, yaw),
+                       _cyl(r, ln), _smat('Bushfire/CharredLog'))]
+        # A broken end and a couple of stubs, so it is a log and not a pipe.
+        links.append(_link(
+            'stub', '%.4f %.4f %.4f 0 %.3f %.3f'
+            % (x + 0.4 * ln * math.cos(yaw), y + 0.4 * ln * math.sin(yaw),
+               r + 0.16, 0.9, yaw + 1.3),
+            _cyl(r * 0.5, 0.45), _smat('Bushfire/CharredLog')))
+        out.append(_model('log_%d' % n, links))
+        n += 1
+        placed += 1
+
+    # Stumps: what is left where a tree came down.
+    placed = 0
+    tries = 0
+    while placed < 16 and tries < 3000:
+        tries += 1
+        h = rng.uniform(0.28, 0.62)
+        r = rng.uniform(0.17, 0.28)
+        x, y = _furn_spot(rng, trees)
+        if not clear(x, y, r + 0.14):
+            continue
+        links = [_link('stump', '%.4f %.4f %.4f 0 0 0' % (x, y, h / 2),
+                       _cyl(r, h), _smat('Bushfire/CharBark'))]
+        # A splintered top: two short angled spikes.
+        for k in range(2):
+            sb = rng.uniform(0, 2 * math.pi)
+            links.append(_link(
+                'splinter%d' % k,
+                '%.4f %.4f %.4f 0 %.3f %.3f'
+                % (x + 0.09 * math.cos(sb), y + 0.09 * math.sin(sb),
+                   h + 0.11, 0.35, sb),
+                _cyl(r * 0.30, 0.30), _smat('Bushfire/CharredLog')))
+        out.append(_model('stump_%d' % n, links))
+        n += 1
+        placed += 1
+
+    # Rock: one outcrop and some scattered stone.
+    placed = 0
+    tries = 0
+    while placed < 18 and tries < 3000:
+        tries += 1
+        x, y = _furn_spot(rng, trees)
+        if not clear(x, y, 0.40 + 0.32):
+            continue
+        links = []
+        for k in range(rng.randint(3, 6)):
+            r = rng.uniform(0.13, 0.32)
+            # Sunk to a third of the radius or less. A stone resting exactly
+            # on the ground shows its full circle and reads as a dropped ball;
+            # a stone bedded into the ground shows a cap, which is what an
+            # outcrop looks like.
+            links.append(_link(
+                'stone%d' % k,
+                '%.4f %.4f %.4f 0 0 %.3f'
+                % (x + rng.uniform(-0.40, 0.40), y + rng.uniform(-0.40, 0.40),
+                   r * rng.uniform(0.10, 0.34), rng.uniform(0, 3.14)),
+                _sphere(r), _smat('Bushfire/Rock')))
+        out.append(_model('rock_%d' % n, links))
+        n += 1
+        placed += 1
+
+    # Grass tussocks: the fuel, in clumps. These are the one thing allowed
+    # anywhere, because they are 0.3 m of grass - a fire lit on one looks
+    # exactly like a fire lit in grass, which is what it is.
+    #
+    # Each one is a few splayed blades rather than a sphere. The first version
+    # used one squashed ball apiece and they came out as beige eggs scattered
+    # over the paddock: a sphere on open ground has a hard round silhouette
+    # and nothing in grass does. Three or four thin cylinders leaning out from
+    # a point cost about the same and read as a tuft, because the silhouette
+    # is spiky instead of round.
+    links = []
+    placed = 0
+    tries = 0
+    while placed < 190 and tries < 9000:
+        tries += 1
+        x = rng.uniform(-BREAK_IN + 0.2, BREAK_IN - 0.2)
+        y = rng.uniform(-BREAK_IN + 0.2, BREAK_IN - 0.2)
+        if any(math.hypot(x - lx, y - ly) < LAUNCH_CLEAR for lx, ly in LAUNCH):
+            continue
+        if any(math.hypot(x - tx, y - ty) < 0.6 for tx, ty in trees):
+            continue
+        # Not on the graded break: the point of a firebreak is that the fuel
+        # has been taken off it.
+        if BREAK_IN < max(abs(x), abs(y)):
+            continue
+        # Three or four blades at a steep lean came out as scattered straw
+        # crosses - a "V" on the ground, which is what you get when there are
+        # too few of them to close up into a clump and they are leaning too
+        # far to read as standing grass. Eight to twelve, shorter, thinner and
+        # nearer upright, and the silhouette closes into a tuft.
+        base = rng.uniform(0.11, 0.20)
+        for k in range(rng.randint(8, 12)):
+            b = rng.uniform(0, 2 * math.pi)
+            lean = rng.uniform(0.10, 0.42)      # radians off vertical
+            h = base * rng.uniform(0.75, 1.45)
+            d = rng.uniform(0.0, 0.075)
+            links.append(_link(
+                'tuft%d_%d' % (placed, k),
+                '%.4f %.4f %.4f 0 %.4f %.4f'
+                % (x + d * math.cos(b), y + d * math.sin(b),
+                   h * 0.46, lean, b),
+                _cyl(rng.uniform(0.011, 0.020), h),
+                _smat(rng.choice(('Bushfire/Tussock', 'Bushfire/Foliage2')))))
+        placed += 1
+    out.append(_model('tussocks', links))
+    return out
+
+
+# ------------------------------------------------------------------ material --
+
+SURFACE_MATERIAL = """
+material %s
+{
+  technique
+  {
+    pass
+    {
+      ambient %s 1.0
+      diffuse 0.95 0.95 0.95 1.0
+      specular 0.02 0.02 0.02 1.0 1.0
+      texture_unit
+      {
+        texture %s
+        scale %s
+        filtering trilinear
+      }
+    }
+  }
+}
+"""
+
+# name, texture, uv scale, ambient reflectance.
+#
+# THE SCALE IS THE SIZE OF THE TILE, NOT THE NUMBER OF TILES. This is Ogre's
+# texture_unit "scale", and it magnifies: scale 2 makes the texture twice as
+# big, so it repeats HALF as often. It is the reciprocal of what it looks
+# like, and reading it the wrong way round is a mistake that does not announce
+# itself - nothing errors, the texture just stops being visible.
+#
+# That is exactly what happened here. The ground was set to "20 20" meaning
+# twenty repeats, which is one twentieth of a tile stretched over a 60 m box:
+# a single smear of colour, and a paddock that rendered as flat yellow through
+# two separate rounds of raising the texture's own contrast. The contrast was
+# never the problem. Every large surface in the world had the same bug, which
+# is why the trunks looked smeared too.
+#
+# So these are 1 / (repeats wanted), and the useful way to read one is as
+# metres-per-tile over the surface it lands on:
+#
+#   ground        60 m box, 0.05 -> 20 repeats  -> 3.0 m of ground per tile
+#   break band  13.2 m box, 0.10 -> 10 repeats  -> 1.3 m per tile
+#   trunk        2.0 m round, 0.33 ->  3 repeats -> 0.7 m of bark per tile
+#   canopy      mapped once, 1.0  -> no tiling, and deliberately: a sphere
+#                                    seams where the wrap meets itself, and on
+#                                    a 0.3 m ball the seam reads as a patch.
+MATERIALS = (
+    ('Bushfire/DryGrass',     'dry_grass.png',     '0.05 0.05', '0.50 0.50 0.50'),
+    ('Bushfire/MineralEarth', 'mineral_earth.png', '0.10 0.40', '0.52 0.52 0.52'),
+    ('Bushfire/BurntGround',  'burnt_ground.png',  '0.55 0.55', '0.34 0.34 0.34'),
+    ('Bushfire/BarkStringy',  'bark_stringy.png',  '0.33 0.55', '0.52 0.52 0.52'),
+    ('Bushfire/BarkSmooth',   'bark_smooth.png',   '0.33 0.55', '0.52 0.52 0.52'),
+    ('Bushfire/CharBark',     'char_bark.png',     '0.33 0.45', '0.48 0.48 0.48'),
+    ('Bushfire/CharredLog',   'charred_log.png',   '0.50 0.50', '0.50 0.50 0.50'),
+    ('Bushfire/Rock',         'rock.png',          '0.70 0.70', '0.52 0.52 0.52'),
+    ('Bushfire/Tussock',      'dry_grass.png',     '1.0 1.0',   '0.55 0.55 0.55'),
+    ('Bushfire/Foliage0',     'foliage0.png',      '1.0 1.0',   '0.55 0.55 0.55'),
+    ('Bushfire/Foliage1',     'foliage1.png',      '1.0 1.0',   '0.55 0.55 0.55'),
+    ('Bushfire/Foliage2',     'foliage2.png',      '1.0 1.0',   '0.55 0.55 0.55'),
+)
+
+
+def write_materials(pkg):
+    d = os.path.join(pkg, 'models', 'bushfire', 'materials', 'scripts')
+    if not os.path.isdir(d):
+        os.makedirs(d)
+    body = ['// Generated by scripts/make_bushfire_world - do not edit by hand.\n']
+    for name, tex, scale, amb in MATERIALS:
+        body.append(SURFACE_MATERIAL % (name, amb, tex, scale))
+    with open(os.path.join(d, 'bushfire.material'), 'w') as f:
+        f.write(''.join(body))
+
+    md = os.path.join(pkg, 'models', 'bushfire')
+    with open(os.path.join(md, 'model.config'), 'w') as f:
+        f.write('<?xml version="1.0"?>\n<model>\n'
+                '  <name>bushfire</name>\n  <version>1.0</version>\n'
+                '  <sdf version="1.6">model.sdf</sdf>\n'
+                '  <description>\n'
+                '    Materials and textures for the uav_bushfire fire ground.\n'
+                '    Not a model to spawn: it exists so Gazebo can resolve the\n'
+                '    model:// URIs the world uses for its materials.\n'
+                '  </description>\n</model>\n')
+    with open(os.path.join(md, 'model.sdf'), 'w') as f:
+        f.write('<?xml version="1.0"?>\n'
+                '<!-- Placeholder: this directory is a material library, not a\n'
+                '     spawnable model, but Gazebo wants an SDF beside the\n'
+                '     model.config. -->\n'
+                '<sdf version="1.6">\n'
+                '  <model name="bushfire"><static>true</static>'
+                '<link name="link"/></model>\n</sdf>\n')
+
+
+# -------------------------------------------------------------------- world --
+
+HEADER = """<?xml version="1.0"?>
+<!-- GENERATED by scripts/make_bushfire_world - do not edit by hand.
+     Regenerate with: rosrun uav_bushfire make_bushfire_world
+
+     The fire ground: a stand of dry eucalypt inside a bulldozed firebreak,
+     with unburnt bush beyond it, for three quadrotors to water-bomb ground
+     fires in.
+
+     WHAT IS LOAD-BEARING HERE, because most of this file is scenery and some
+     of it is not:
+
+     THE EIGHT TRUNKS IN THE STAND. At (+-2.5, +-2.5) and on the axes at 4.5,
+     each with a collision cylinder of radius 0.35 and height 3.0. That list
+     is duplicated in bushfire_fleet.launch as ~obstacles and read by three
+     nodes - fire_spotter, so it never lights a fire inside a trunk it cannot
+     see; fire_suppressor, to govern near one; collision_monitor, to score a
+     strike. Move a trunk here and that file has to move with it. The
+     generator prints the list and refuses to write a world where they differ.
+
+     ONLY TRUNKS COLLIDE. Everything else on the fire ground - canopies,
+     branches, roots, logs, stumps, rocks, tussocks - carries a visual and NO
+     collision, and that is deliberate rather than an oversight. The laser is
+     a horizontal plane on a mast: it sees trunks perfectly and cannot see
+     anything above or below the aircraft. Collision geometry the laser cannot
+     return would be an obstacle the drone can hit and has no sensor able to
+     detect, which is the one scene fire_suppressor's own header says it
+     cannot handle. Giving the trees tops a rotor passes through keeps the
+     picture honest: the drone only ever collides with things it could have
+     seen coming.
+
+     THERE IS NO WALL, and that is a change from earlier versions of this
+     file. Containment is fire_suppressor's geofence - soft at 4.8 m, hard at
+     8.0 m where the aircraft is teleported back to its launch point. The four
+     3 m walls that used to stand at +-6 made the place read as a room and
+     were never the backstop they looked like: the suppressor's header records
+     a drone going over one at 3.5 m and still accelerating 275 m away.
+
+     THE SURROUNDING BUSH STARTS AT 8.8 m, OUTSIDE THAT HARD GEOFENCE. Its
+     trunks do collide - they are laser-visible, so ghosts would be the
+     dishonest option - but they are NOT in ~obstacles, so collision_monitor
+     does not score them. They therefore have to sit where no aircraft can
+     arrive. At 7.2 m they were inside the band a soft-fenced drone reaches
+     and a run put uav_1 straight through them.
+
+     TRUNK HEIGHT. 3 m against a top cruise lane of 2.60, to stop the obvious
+     cheat - an aircraft's answer to an obstacle is to go over it, and if it
+     can, the reactive avoidance this scenario is built around never runs.
+
+     THE MIDDLE IS CLEAR. Three launch points on the y axis at (0, 0) and
+     (0, +-2.2). No furniture within 1.1 m of any of them.
+
+     THE FURNITURE IS OUTSIDE THE FIRE ZONE. fire_spotter lights fires within
+     +-4.0 m. Logs, stumps and rocks sit beyond 4.3 m, so a fire can never be
+     lit inside one. They are NOT in ~obstacles and must not be added to it:
+     fire_suppressor's governor treats every entry as a full-height keep-out
+     with no notion of z, so a 0.4 m log would push aircraft off course at
+     cruise for something they fly over. -->
+<sdf version="1.6">
+  <world name="default">
+
+"""
+
+FOOTER = """
+    <gui>
+      <camera name="user_camera">
+        <pose>-11 -11 9 0 0.5 0.785</pose>
+      </camera>
+    </gui>
+
+  </world>
+</sdf>
+"""
+
+
+def scene(shadows, haze):
+    """Lights and atmosphere.
+
+    Two lights, because outdoors has two. The old world had model://sun and an
+    <ambient> of 0.6, and one directional light leaves the underside of a
+    canopy and the inner face of the bund nearly black - which looks wrong and
+    flattens exactly the silhouettes the extra geometry was added to create.
+    The key light here is low and warm, the way sun through smoke actually is,
+    and there is a weak cool shadowless fill from the opposite side.
+
+    One thing worth knowing before tuning this: <scene><ambient> is the
+    viewer's ambient. Raising it changes the Gazebo window and changes what
+    any camera sensor sees not at all. There are no cameras in this package,
+    so here it really is only the view - but the same setting in
+    uav_farm_survey is a trap and it is the same setting.
+
+    Shadows default OFF, which is a frame rate decision rather than a taste
+    one: this world now has around 200 visual bodies, and three aircraft with
+    a 1 kHz physics step are already the expensive thing on this machine. The
+    fires each carry a point light of their own with cast_shadows off for the
+    same reason. --shadows turns them on for a screenshot.
+    """
+    fog = ''
+    if haze:
+        # Smoke haze. Linear, and starting well outside the 12 m arena, so it
+        # hazes the horizon and the bund without putting a film over the fires
+        # the whole scenario is about.
+        fog = ("""      <fog>
+        <color>0.62 0.55 0.48 1</color>
+        <type>linear</type>
+        <start>9</start>
+        <end>58</end>
+        <density>0.72</density>
+      </fog>
+""")
+    return ("""    <scene>
+      <ambient>0.42 0.41 0.39 1</ambient>
+      <background>0.66 0.60 0.53 1</background>
+      <shadows>%s</shadows>
+%s    </scene>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <!-- Key: low, warm, and from the north-west. Sun through smoke. -->
+    <light name="sun_key" type="directional">
+      <cast_shadows>%s</cast_shadows>
+      <pose>0 0 12 0 0 0</pose>
+      <diffuse>0.96 0.86 0.70 1</diffuse>
+      <specular>0.18 0.16 0.13 1</specular>
+      <direction>0.42 0.36 -0.83</direction>
+      <attenuation><range>90</range><constant>0.9</constant>
+        <linear>0.01</linear><quadratic>0.001</quadratic></attenuation>
+    </light>
+
+    <!-- Fill: cool, weak, from the opposite side, and never casts. This is
+         the light that keeps the underside of a crown from going black. -->
+    <light name="sky_fill" type="directional">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 12 0 0 0</pose>
+      <diffuse>0.34 0.37 0.44 1</diffuse>
+      <specular>0.0 0.0 0.0 1</specular>
+      <direction>-0.55 -0.42 -0.72</direction>
+      <attenuation><range>90</range><constant>1.0</constant>
+        <linear>0.0</linear><quadratic>0.0</quadratic></attenuation>
+    </light>
+
+""" % ('true' if shadows else 'false', fog,
+       'true' if shadows else 'false'))
+
+
+def _unsafe_furniture(models, trees):
+    """Any log, stump or rock link growing out of a trunk.
+
+    Reads the generated XML rather than the placement rule, so an offset the
+    rule did not account for still shows up - which is the point, and it has
+    earned its keep twice: it caught a rock cluster scattering a stone past a
+    legal base, and a windrow laid on a CIRCLE while the fire zone is a SQUARE
+    (a circle of radius 12.95 is outside +-12 near the axes and inside it near
+    the diagonals). Returns (name, x, y) or None.
+    """
+    for m in models:
+        tag = re.match(r'  <model name="([^"]+)"', m)
+        if not tag or not tag.group(1).startswith(('log_', 'stump_', 'rock_')):
+            continue
+        for pose in re.findall(r'<pose>([^<]+)</pose>', m):
+            v = pose.split()
+            x, y = float(v[0]), float(v[1])
+            if not _clear_of_trunks(x, y, trees):
+                return tag.group(1), x, y
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--seed', type=int, default=11)
+    ap.add_argument('--shadows', action='store_true',
+                    help='shadow-casting key light; costs frames, looks better')
+    ap.add_argument('--no-haze', action='store_true',
+                    help='drop the smoke fog')
+    ap.add_argument('--pkg', default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..'))
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+
+    stand = stand_positions(rng)
+    trees = [Tree(rng, 'tree_%d' % i, x, y) for i, (x, y) in enumerate(stand)]
+
+    pre = [ground(), firebreak_floor(), burn_scars(rng, stand)]
+    post = surrounds(rng)
+    post += furniture(rng, stand)
+
+    # Constraint 4, checked on the finished geometry rather than on the rule
+    # that produced it. The placement rule tests a cluster's base position, and
+    # an early version let a rock cluster scatter a stone 0.5 m past a legal
+    # base and into the fire zone. Checking the output catches that class of
+    # mistake; checking the input is how it got in.
+    bad = _unsafe_furniture(post, stand)
+    if bad:
+        raise SystemExit('%s at (%.2f, %.2f) overlaps a trunk - ground '
+                         'furniture must not grow out of collision geometry'
+                         % (bad[0], bad[1], bad[2]))
+
+    if BUSH_IN <= FENCE_HARD:
+        raise SystemExit('bush at %.2f m is inside the hard geofence at %.2f - '
+                         'aircraft could reach trees that nothing scores'
+                         % (BUSH_IN, FENCE_HARD))
+    if FENCE_SOFT <= FIRE_HALF:
+        raise SystemExit('soft geofence %.2f is inside the fire zone %.2f - '
+                         'aircraft would be turned back from fires they were '
+                         'sent to' % (FENCE_SOFT, FIRE_HALF))
+
+    # The obstacle list, written where the launch can load it. This is the
+    # whole reason the trunk positions are generated rather than hardcoded:
+    # thirty of them maintained by hand in two files is a drift waiting to
+    # happen, and the failure is silent - fire_spotter lights a fire inside a
+    # trunk the aircraft cannot see and grinds against the bark until the
+    # reignite timer moves it.
+    obs = os.path.join(args.pkg, 'config', 'obstacles.yaml')
+    if not os.path.isdir(os.path.dirname(obs)):
+        os.makedirs(os.path.dirname(obs))
+    with open(obs, 'w') as f:
+        f.write('# GENERATED by scripts/make_bushfire_world - do not edit.\n'
+                '#\n'
+                '# Every trunk in the fire ground, as [x, y, radius]. Loaded by\n'
+                '# bushfire_fleet.launch into fire_spotter (never light a fire\n'
+                '# inside a trunk it cannot see), fire_suppressor (govern near\n'
+                '# one) and collision_monitor (score a strike). It is written\n'
+                '# by the same pass that places the trees, so the world and\n'
+                '# this file cannot disagree.\n'
+                'obstacles:\n')
+        for x, y in stand:
+            f.write('  - [%.3f, %.3f, %.2f]\n' % (x, y, TRUNK_R))
+
+    write_materials(args.pkg)
+    body = (HEADER + scene(args.shadows, not args.no_haze)
+            + ''.join(pre) + ''.join(t.model() for t in trees)
+            + ''.join(post) + FOOTER)
+    out = os.path.join(args.pkg, 'worlds', 'bushfire.world')
+    with open(out, 'w') as f:
+        f.write(body)
+
+    n_vis = body.count('<visual ')
+    n_col = body.count('<collision ')
+    print('fire ground -> %s' % out)
+    print('  %d trees, %d visual bodies, %d collision bodies'
+          % (len(trees), n_vis, n_col))
+    n_bush = len([m for m in post if m.startswith('  <model name="bush_')])
+    print('  collisions: %d trunks in the stand (r %.2f, h %.1f) + %d in the '
+          'surrounding bush + ground' % (len(trees), TRUNK_R, TRUNK_H, n_bush))
+    print('  no walls: the graded break at %.1f-%.1f m is the fire ground edge'
+          % (BREAK_IN, BREAK_OUT))
+    print('  everything else is visual only - the laser cannot see it, so it '
+          'must not be hittable')
+    print('  obstacle list -> %s  (%d trunks; the launch loads this file, so\n'
+          '                    nothing is duplicated and nothing can drift)'
+          % (obs, len(stand)))
+    print('\n  fire ground : %.0f x %.0f m, fires anywhere inside +-%.1f m'
+          % (2 * FIRE_HALF, 2 * FIRE_HALF, FIRE_HALF))
+    print('  geofence    : soft %.1f, hard %.1f  (set these in one_uav.launch)'
+          % (FENCE_SOFT, FENCE_HARD))
+    print('  launch args : world_half_size:=%.1f fence_half_size:=%.1f '
+          'fence_hard_size:=%.1f' % (FIRE_HALF, FENCE_SOFT, FENCE_HARD))
+    print('  clear       : launch points %s'
+          % ', '.join('(%.1f, %.1f)' % p for p in LAUNCH))
+
+
+if __name__ == '__main__':
+    main()

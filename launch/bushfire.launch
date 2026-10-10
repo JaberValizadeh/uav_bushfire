@@ -1,0 +1,232 @@
+<?xml version="1.0"?>
+<!--
+  bushfire.launch
+  ===============
+  Three hector quadrotors water-bomb ground fires in a stand of timber.
+
+    Global:
+      1. Gazebo + worlds/bushfire.world
+      2. fire_spotter - owns every fire, keeps the ledger of who is on what
+
+    Per drone (namespaces uav_0, uav_1, uav_2), from one_uav.launch:
+      3. the airframe, its plugins and controller/twist
+      4. pose_fire_monitor - logs pose, the job and the shares
+      5. fire_suppressor   - chooses a fire; takeoff, align, chase, descend,
+                             climb; scoreboard
+
+  fire_spotter is started outside every namespace, which is the structural
+  difference from the treasure version of this package. Fires are shared: any
+  aircraft can take any of them, several can take the same one, and the value
+  of a fire is split equally between the drones that chose it - so one node has
+  to hold the whole picture rather than each drone owning a private target.
+
+  It does not hand out work, though. Each drone reads the board, picks the fire
+  with the best share-per-second for itself and claims it; the spotter accepts
+  the claim, meters the bombing and pays everybody out.
+
+  This file is nothing but the three staged launches run together, and every
+  argument it takes is passed straight through to one of them:
+
+    bushfire_world.launch   Gazebo + worlds/bushfire.world
+    bushfire_fleet.launch   the three aircraft and the fire_spotter
+    bushfire_rviz.launch    the view                        (rviz:=true)
+
+  Run them separately when working on one piece - the world is the slowest part
+  to load and the part you least often want to restart:
+
+    roslaunch uav_bushfire bushfire_world.launch    # leave this up
+    roslaunch uav_bushfire bushfire_fleet.launch
+    roslaunch uav_bushfire bushfire_rviz.launch
+
+  Usage:
+    source ~/uav_ws/src/uav_pick_place/setup_uav.bash
+    roslaunch uav_bushfire bushfire.launch
+    roslaunch uav_bushfire bushfire.launch gui:=false num_hotspots:=8
+    roslaunch uav_bushfire bushfire.launch rviz:=true
+
+  Topics:
+    /bushfire/hotspots                 every fire, with its value and crew
+    /bushfire/claims                   which fire each drone has chosen
+    /bushfire/markers                  RViz, world frame
+    /uav_0/bushfire/target             uav_0's job, and its station on it
+    /uav_0/ground_truth/state          pose
+    /uav_0/cmd_vel                     body-frame velocity command
+    /uav_0/scan                        Hokuyo on the mast
+-->
+<launch>
+
+
+  <!-- NOTE: every argument below is declared in bushfire_fleet.launch too, and
+       that file is the owner of the defaults. They are repeated here so the
+       one-command form takes the same arguments the staged form does - and
+       because pass_all_args forwards THIS file's value, a default changed only
+       in the fleet file is silently overridden when run from here. Change both.
+       (crew_separation was changed in one and not the other, and the fleet ran
+       for a whole measurement on the stale value.) -->
+  <arg name="gui"      default="true" />
+  <arg name="headless" default="false" />
+
+  <!-- RViz shows the whole incident in one view: every fire with its intensity
+       label, each aircraft, and the scan each one is steering by. Off by
+       default because Gazebo is already drawing the scene and this machine
+       would rather spend the frames on physics. -->
+  <arg name="rviz"        default="false" />
+  <arg name="rviz_config" default="$(find uav_bushfire)/rviz/bushfire.rviz" />
+
+  <arg name="world" default="$(find uav_bushfire)/worlds/bushfire.world" />
+
+  <!-- Fires burning at once. More than the fleet size on purpose: the choice
+       each drone makes is only interesting if there is more than one thing
+       worth choosing, and with three fires and three drones the answer is
+       always "take the free one". Five means a drone regularly has to weigh a
+       small fire it would own against a share of a big one. -->
+  <arg name="num_hotspots" default="7" />
+
+  <!-- Fires are lit anywhere inside +-world_half_size: a 12 x 12 m fire
+       ground. Documented where it is consumed, in bushfire_fleet.launch.
+
+       NOTE this file passes every argument down with pass_all_args, so these
+       defaults SHADOW the fleet's. That is what the mechanism is for, and it
+       is also the trap: changing world_half_size in bushfire_fleet.launch
+       alone changes nothing when the run is started from here, which is how
+       it is normally started. Both copies, or neither. -->
+  <arg name="world_half_size" default="6.0" />
+
+  <!-- Suppression: horizontal radius AND altitude ceiling, both. The drone has
+       to be over the fire and down at it.
+
+       Both are wider than a single drone needs, because a crew does not stand
+       on the fire - it stands on a ring around it, stacked in altitude. The
+       radius has to contain the ring (0.71 m for a crew of three at 1.0 m
+       separation) and the ceiling has to contain the stack (0.95 + 2 x 0.15 =
+       1.25 for the top member), both with margin, or the geometry that keeps
+       drones off each other would quietly stop them working. -->
+  <arg name="collect_dist"      default="1.00" />
+  <arg name="suppress_altitude" default="1.45" />
+  <arg name="drop_altitude"     default="0.95" />
+
+  <!-- What a fire costs, against what it is worth. Its intensity (1-10) is
+       both: it pays that many points, split equally between every drone that
+       chose it, and it takes intensity x work_per_intensity drone-seconds of
+       bombing to put out, with every crew member overhead contributing a
+       second of work per second.
+
+       That pair is the whole mechanic. Payout alone makes joining somebody
+       else's fire strictly worse than taking your own and no crew ever forms;
+       work alone makes crews free and everybody piles onto one fire. Together,
+       a drone maximises share per second - and the fire where that is best is
+       the big one, which is how big fires draw crews without anything being
+       told to make them. 1.2 puts a lone drone on a 10 for twelve seconds and
+       a crew of three on it for four. -->
+  <arg name="work_per_intensity" default="1.2" />
+
+  <!-- Most drones one fire will take. Three is the fleet: the cap is really a
+       geometric one - stations get closer as the ring fills - so raising it
+       means raising crew_separation, collect_dist and the ceiling with it. -->
+  <arg name="max_crew" default="3" />
+
+  <!-- ...and a crew closes once it is this far through the job. Equal shares
+       plus shared labour has exactly one degenerate corner: the time left in a
+       fire collapses as it finishes, so a fire at 95% looks like the best
+       thing on the board and joining it pays a full share for arriving after
+       it is over. Measured on the first run of this - a drone bombed a 7 alone
+       for fourteen seconds and was joined at 0.3 drone-seconds remaining by
+       both others, keeping 2.33 of it. Only applies to a fire that already has
+       a crew: taking over an abandoned job at 90% is fine, there is nobody to
+       take it from. -->
+  <arg name="join_deadline" default="0.7" />
+
+  <!-- Crew geometry. Neighbours on the ring are kept this far apart and each
+       member sits a step higher than the last, because two aircraft holding
+       station on the same point is a collision and with crews that is the
+       normal case rather than bad luck. -->
+  <arg name="crew_separation"    default="1.30" />
+  <arg name="crew_altitude_step" default="0.15" />
+
+  <!-- A commitment is binding, so something has to break it when the aircraft
+       cannot honour it - stuck in a thicket, or in a respawn loop. Long on
+       purpose: this is a fault handler, not a way to change your mind. (A
+       drone that gets rescued gives its fire up itself, immediately.) -->
+  <arg name="commit_timeout" default="90.0" />
+
+  <!-- ...and not *below* this, because "under the ceiling" is also true of an
+       aircraft sitting on its landing gear. Without a floor, a fire lit near a
+       launch point is scored by a drone that has not taken off: measured, two
+       of thirty-one drops in a run were awarded at 0.18 m, four seconds before
+       anybody was airborne. -->
+  <arg name="min_drop_altitude" default="0.45" />
+
+  <!-- A suppressed fire leaves the world and the board for this long before
+       the slot lights somewhere else. Without the gap the model was moved
+       straight to its next position, so a fire never went *out* from the
+       viewer's side - it blinked from under three drones to across the arena,
+       which reads as a fire that moved rather than one that was beaten. The
+       pause is also what makes deleting and respawning the model safe rather
+       than racy; see _extinguish() in fire_spotter. -->
+  <arg name="extinguish_pause" default="1.5" />
+
+  <!-- What a fire looks like. Its intensity drives the geometry - flame
+       height, ember bed, smoke column and the radius its light throws - so a
+       10 is a bonfire that lights the trunks around it and a 1 is a smoulder.
+       flame_scale is a taste knob on top of that; fire_light is the single
+       biggest cue, because it is the only part that illuminates anything else
+       (emissive geometry lights nothing); flicker yaws the flames a few
+       degrees at this rate so they move. Turn the light off, or flicker down,
+       if the frame rate hurts on this machine. -->
+  <arg name="flame_scale" default="1.0" />
+  <arg name="fire_light"  default="true" />
+  <arg name="flicker_hz"  default="4.0" />
+
+  <!-- Where the trees are, so the spotter never lights a fire inside a trunk;
+       it cannot see them. GENERATED - scripts/make_bushfire_world writes this
+       file in the same pass that places the trees, so the world and the
+       obstacle list cannot drift. Regenerate both with:
+         rosrun uav_bushfire make_bushfire_world -->
+  <arg name="obstacle_file"
+       default="$(find uav_bushfire)/config/obstacles.yaml" />
+
+  <!-- Transit altitude. Well above the suppression ceiling, because the gap
+       between the two *is* the bombing run: at 1.6 the aircraft dipped barely
+       half a metre and the drop was hard to see happening. Still well under
+       the 3 m trunks, so the drones remain inside the timber and have to go
+       round trees rather than over them. -->
+  <arg name="cruise_altitude" default="1.70" />
+  <arg name="linear_speed"    default="1.2" />
+  <arg name="angular_gain"    default="2.0" />
+
+  <!-- Switch from flying to station-keeping inside this, measured to the
+       drone's own station rather than to the fire. Kept tight because the
+       station is now a slot other aircraft are standing next to: arriving
+       loosely into a crew is how two of them meet. -->
+  <arg name="arrive_radius" default="0.60" />
+
+  <!-- Avoidance ranges are much wider than the TurtleBot3's 0.45/0.25: these
+       drones cruise at 1.2 m/s against its 0.3, and stopping distance is what
+       these numbers really encode. A multirotor also has to pitch back to
+       decelerate, which costs distance a differential drive does not spend. -->
+  <arg name="avoid_dist" default="1.6" />
+  <arg name="stop_dist"  default="0.9" />
+
+  <!-- =============================== 1. world ============================ -->
+  <include file="$(find uav_bushfire)/launch/bushfire_world.launch">
+    <arg name="gui"      value="$(arg gui)" />
+    <arg name="headless" value="$(arg headless)" />
+    <arg name="world"    value="$(arg world)" />
+  </include>
+
+  <!-- =============================== 2. fleet ============================
+       pass_all_args, because every tuning argument above belongs to the fleet
+       and listing them twice is how the two copies drift apart. -->
+  <include file="$(find uav_bushfire)/launch/bushfire_fleet.launch"
+           pass_all_args="true" />
+
+  <!-- ================================ 3. view ============================
+       Defined once in bushfire_rviz.launch, so running it here and running it
+       separately against an already-flying incident are the same thing. -->
+  <include if="$(arg rviz)"
+           file="$(find uav_bushfire)/launch/bushfire_rviz.launch">
+    <arg name="rviz_config" value="$(arg rviz_config)" />
+    <arg name="delay"       value="12" />
+  </include>
+
+</launch>

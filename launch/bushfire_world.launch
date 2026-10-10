@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  bushfire_world.launch
+  =====================
+  Step 1 of 3: the stand of timber, and nothing else.
+
+    roslaunch uav_bushfire bushfire_world.launch
+
+  Gazebo with worlds/bushfire.world. No aircraft, no fires, no spotter. This
+  also brings up the roscore the other two steps attach to, so it has to start
+  first.
+
+  Leave it running. The world is the slowest part to load and the part you least
+  often want to restart; staging it this way means the fleet and the view can
+  each be killed and relaunched against a world that never moves.
+-->
+<launch>
+
+  <!-- The world's materials live in models/bushfire inside this package, and
+       the world refers to them as model://bushfire/materials/... Gazebo
+       resolves a model:// URI only against GAZEBO_MODEL_PATH, so without this
+       every textured surface in the fire ground falls back to flat white -
+       which is not an error, just a world that looks worse than the one it
+       replaced. Prepended rather than replacing, so model://sun and the
+       hector models still resolve. -->
+  <env name="GAZEBO_MODEL_PATH"
+       value="$(find uav_bushfire)/models:$(optenv GAZEBO_MODEL_PATH)" />
+
+  <arg name="gui"      default="true" doc="Gazebo's own window" />
+  <arg name="headless" default="false" />
+  <arg name="paused"   default="false" />
+  <arg name="world"    default="$(find uav_bushfire)/worlds/bushfire.world" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name"   value="$(arg world)" />
+    <arg name="gui"          value="$(arg gui)" />
+    <arg name="headless"     value="$(arg headless)" />
+    <arg name="paused"       value="$(arg paused)" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="debug"        value="false" />
+  </include>
+
+</launch>

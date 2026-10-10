@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>uav_bushfire</name>
+  <version>0.1.0</version>
+  <description>
+    Three hector quadrotors water-bomb ground fires in a Gazebo stand of
+    timber. A single fire_spotter owns every fire and tasks the fleet
+    nearest-first; each aircraft transits at cruise altitude with reactive
+    laser avoidance, then holds station over its fire and descends onto it to
+    drop. Suppression needs both a horizontal radius and an altitude ceiling,
+    so flying over a fire is not putting it out. A running score is printed per
+    aircraft.
+  </description>
+
+  <maintainer email="valizadeh.au@gmail.com">Jaber Valizadeh</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf</depend>
+  <depend>gazebo_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <!-- The airframe, its Gazebo plugins, its twist controller and the Hokuyo
+       description. Source-built siblings in this workspace; source
+       uav_pick_place/setup_uav.bash. -->
+  <exec_depend>hector_quadrotor_description</exec_depend>
+  <exec_depend>hector_quadrotor_gazebo</exec_depend>
+  <exec_depend>hector_quadrotor_controller</exec_depend>
+  <exec_depend>hector_quadrotor_model</exec_depend>
+  <exec_depend>hector_sensors_description</exec_depend>
+
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <!-- Only for rviz:=true; the hunt itself runs without it. -->
+  <exec_depend>rviz</exec_depend>
+
+  <export></export>
+</package>

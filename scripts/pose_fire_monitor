@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""
+pose_fire_monitor - passive observer for one drone's tasking.
+
+It commands nothing and decides nothing. It exists so there is a record of
+where an aircraft was and what it put out that does not depend on the
+suppressor's scoreboard being on screen - with three drones logging at once,
+the scoreboards interleave and scroll.
+
+It also watches the whole fire ground, not just this drone's assignment, which
+the treasure version had no way to do. With one private target per robot there
+was nothing else to see; with a shared incident the interesting question when a
+drone is idle is usually what else was burning at the time - and now also what
+crew was on it, since that is what the drone was weighing when it chose.
+
+Subscriptions
+-------------
+  ground_truth/state    nav_msgs/Odometry
+  bushfire/target       uav_bushfire/Hotspot       this drone's tasking
+  /bushfire/hotspots    uav_bushfire/HotspotArray  the whole fire ground
+
+ROS Parameters (private, ~)
+---------------------------
+  ~pose_log_hz   float  Rate at which pose is printed (default 0.5 Hz)
+"""
+
+import math
+
+import rospy
+from nav_msgs.msg import Odometry
+from tf.transformations import euler_from_quaternion
+
+from uav_bushfire.msg import Hotspot, HotspotArray
+
+
+class PoseFireMonitor:
+
+    def __init__(self):
+        rospy.init_node('pose_fire_monitor', anonymous=False)
+
+        self._ns = rospy.get_namespace().strip('/') or 'uav'
+        self._log_hz = rospy.get_param('~pose_log_hz', 0.5)
+        self._last_log = rospy.Time(0)
+
+        self._fire = None
+        self._burning = 0
+        self._crewed = 0
+        self._score = 0.0
+        self._drops = 0
+
+        rospy.Subscriber('ground_truth/state', Odometry, self._odom_cb)
+        rospy.Subscriber('bushfire/target', Hotspot, self._target_cb)
+        rospy.Subscriber('/bushfire/hotspots', HotspotArray, self._ground_cb)
+
+        rospy.loginfo('[MONITOR %s] started, logging pose at %.1f Hz',
+                      self._ns, self._log_hz)
+
+    def _odom_cb(self, msg):
+        now = rospy.Time.now()
+        if (now - self._last_log).to_sec() < 1.0 / max(self._log_hz, 1e-6):
+            return
+        self._last_log = now
+
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        v = msg.twist.twist.linear
+        speed = math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)
+
+        if self._fire is None:
+            rospy.loginfo('[MONITOR %s] pos=(%.2f, %.2f, %.2f) yaw=%.1f deg '
+                          'speed=%.2f m/s | on nothing | %d burning, %d crewed',
+                          self._ns, p.x, p.y, p.z, math.degrees(yaw), speed,
+                          self._burning, self._crewed)
+            return
+
+        f = self._fire
+        # Horizontal only, and to the fire rather than to this drone's station
+        # on it. The fire is on the ground and the drone is not trying to reach
+        # its altitude, so a 3D distance here would report a gap the aircraft
+        # is never going to close and never should.
+        dist_xy = math.hypot(f.x - p.x, f.y - p.y)
+        done = (100.0 * f.work_done / f.work_total) if f.work_total > 0 else 0.0
+        rospy.loginfo('[MONITOR %s] pos=(%.2f, %.2f, %.2f) yaw=%.1f deg '
+                      'speed=%.2f m/s | fire %d at (%.2f, %.2f) dist=%.2f m '
+                      'worth %.0f split %d ways = %.2f, %.0f%% out '
+                      '| %d burning, %d crewed | score=%.2f over %d jobs',
+                      self._ns, p.x, p.y, p.z, math.degrees(yaw), speed,
+                      f.id, f.x, f.y, dist_xy, f.intensity, max(f.crew, 1),
+                      f.share, done, self._burning, self._crewed,
+                      self._score, self._drops)
+
+    def _target_cb(self, msg):
+        if msg.suppressed:
+            # reward, not intensity: the fire's value was shared equally with
+            # everyone else who chose it.
+            self._score += msg.reward
+            self._drops += 1
+            rospy.loginfo('[MONITOR %s] OUT: fire %d worth %.0f at (%.2f, %.2f) '
+                          'split %d ways -> +%.2f, score %.2f',
+                          self._ns, msg.id, msg.intensity, msg.x, msg.y,
+                          max(msg.crew, 1), msg.reward, self._score)
+            self._fire = None
+            return
+        self._fire = msg
+
+    def _ground_cb(self, msg):
+        self._burning = len(msg.hotspots)
+        self._crewed = sum(1 for h in msg.hotspots if h.crew > 0)
+
+
+def main():
+    PoseFireMonitor()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

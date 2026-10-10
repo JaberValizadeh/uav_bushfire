@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""
+make_bushfire_textures - the tiling textures the fire ground is built from.
+
+Every surface in this world used to be a flat <diffuse> colour: eight brown
+cylinders with green balls on top, four grey-brown boxes for the firebreak, and
+Gazebo's stock grey chequerboard underneath the lot. That reads as a diagram of
+a fire ground rather than a fire ground. Texture is most of the difference, and
+it costs nothing at run time - a tiled 256 px image is cheaper than the extra
+geometry you would otherwise need to break up a flat surface.
+
+What this world is, and what that means for the palette
+-------------------------------------------------------
+It is dry eucalypt forest in fire weather. That is a specific look and it is
+not the orchard next door: the grass is *cured*, not green - straw and buff and
+dead - the leaf is olive and blue-grey rather than the fresh green of an apple
+tree, and the ground between the trees is litter and bare earth rather than
+sward. Getting this wrong in the safe direction (everything lush and green)
+is what makes a bushfire scene look like a park with a campfire in it.
+
+The one colour rule
+-------------------
+The fires are the only saturated warm thing in this world, and they have to
+stay that way. A ground texture that is genuinely orange competes with the
+flames for the eye, and at a glance across the stand you can no longer tell
+which glow is a fire and which is dirt. So every surface here is checked as it
+is written: nothing may be both warm-hued and strongly saturated.
+
+This is a *look* constraint rather than a correctness one, and the difference
+from uav_farm_survey is worth being clear about. There, the equivalent check
+was load-bearing - fruit_detector is a colour detector, and a texture that
+read as red at saturation 160 became a false apple in every frame. Nothing in
+uav_bushfire looks at a camera: the fires are published by fire_spotter and
+the obstacles are found with a laser. Fail this check here and the scenario
+still scores exactly the same. It just stops being legible.
+
+  rosrun uav_bushfire make_bushfire_textures
+  rosrun uav_bushfire make_bushfire_textures --size 512
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PKG = os.path.dirname(HERE)
+OUT = os.path.join(PKG, 'models', 'bushfire', 'materials', 'textures')
+SEED = 17
+
+# The fire palette, for the check below. fire_spotter builds its flames from
+# these: embers at (0.8, 0.15, 0.0), tongues climbing to (1.0, 0.86, 0.42).
+# A ground texture is "competing with the fire" when it lands in the same warm
+# hue band at a comparable saturation.
+FIRE_HUE_MAX = 40.0        # OpenCV scale: 0 = red, 30 = orange-yellow
+FIRE_SAT_MIN = 150.0       # below this a warm colour reads as earth, not flame
+
+
+# ------------------------------------------------------------------ helpers --
+
+def noise(size, scale, rng):
+    """Noise that wraps, so a tiled surface has no seams."""
+    f = ndimage.gaussian_filter(rng.random((size, size)), scale, mode='wrap')
+    span = float(f.max() - f.min())
+    return (f - f.min()) / (span if span > 1e-9 else 1.0)
+
+
+def mix(a, b, w):
+    return np.array(a) * (1 - w[..., None]) + np.array(b) * w[..., None]
+
+
+def streaks(size, rng, count, blur, vertical=True):
+    """Directional streaks: bark fibre, grass blades, dozer scrape marks.
+
+    Built by blurring noise hard along one axis and barely at all across it,
+    which is what turns a cloud into a grain.
+    """
+    f = rng.random((size, size))
+    sig = (blur, 0.6) if vertical else (0.6, blur)
+    f = ndimage.gaussian_filter(f, sig, mode='wrap')
+    f = f + 0.35 * np.sin(np.linspace(0, 2 * np.pi * count, size)[
+        None, :] if vertical else np.linspace(0, 2 * np.pi * count, size)[
+        :, None])
+    span = float(f.max() - f.min())
+    return (f - f.min()) / (span if span > 1e-9 else 1.0)
+
+
+def hsv_of(img):
+    """OpenCV-scale H (0-179), S and V (0-255), without needing OpenCV."""
+    x = img.astype(np.float64)
+    v = x.max(axis=2)
+    c = v - x.min(axis=2)
+    s = np.where(v > 0, 255.0 * c / np.where(v > 0, v, 1), 0.0)
+    r, g, b = x[..., 0], x[..., 1], x[..., 2]
+    safe = np.where(c > 0, c, 1.0)
+    h = np.zeros_like(v)
+    rm, gm, bm = (v == r) & (c > 0), (v == g) & (c > 0), (v == b) & (c > 0)
+    gm &= ~rm
+    bm &= ~rm & ~gm
+    h[rm] = (((g - b) / safe)[rm] % 6.0)
+    h[gm] = ((b - r) / safe)[gm] + 2.0
+    h[bm] = ((r - g) / safe)[bm] + 4.0
+    return h * 30.0, s, v
+
+
+def flame_like(img):
+    """Fraction of pixels that would read as flame rather than as ground.
+
+    The worst pixel is what matters, not the mean - a texture has a spread, and
+    an average comfortably under the line tells you nothing about the tail. So
+    this returns a share and the caller also looks at the peak.
+    """
+    h, s, _ = hsv_of(img)
+    warm = h <= FIRE_HUE_MAX
+    return float((warm & (s >= FIRE_SAT_MIN)).mean())
+
+
+def worst_warm_saturation(img):
+    """Highest saturation among the warm-hued pixels.
+
+    Earth and dry grass are warm-hued *by definition* - buff, straw, ochre and
+    brown all sit under hue 40 - so this is effectively the texture's peak
+    saturation, and it is the number that decides whether it glows.
+    """
+    h, s, _ = hsv_of(img)
+    warm = h <= FIRE_HUE_MAX
+    return float(s[warm].max()) if warm.any() else 0.0
+
+
+# ----------------------------------------------------------------- surfaces --
+
+def dry_grass(size, rng):
+    """Cured summer grass: the fuel the whole scenario is about.
+
+    Straw and buff rather than green. Fire season grass is dead grass, and a
+    green sward under a bushfire is the single thing that would make this scene
+    read wrong from any distance.
+    """
+    # Two rounds of this rendered as a flat yellow field, and the second one
+    # is the instructive failure: adding metre-scale variation was necessary
+    # and was not sufficient, because the *amplitude* was still small. A
+    # texture whose features all sit within twenty units of its own mean will
+    # average to that mean at any distance where the features stop being
+    # resolvable, and 60 m of ground seen from a drone is exactly that. So the
+    # patches here are far enough apart in value to survive being averaged -
+    # roughly 70 units between the palest cured grass and the darkest swale -
+    # and the fine blade detail is a dressing on top for when a drone is down
+    # on the deck bombing.
+    broad = noise(size, size / 2.6, rng)          # metres-wide patchiness
+    mid = noise(size, size / 7.0, rng)
+    blades = streaks(size, rng, 42, 3.4)
+    img = mix((78, 68, 40), (198, 180, 122), 0.10 + 0.6 * broad + 0.34 * mid)
+    img = img * (0.82 + 0.34 * blades)[..., None]
+    # Bare scrapes where the sward is thin and the soil comes through.
+    bare = np.clip((noise(size, size / 5.0, rng) - 0.48) * 2.4, 0, 1)
+    img = mix(img, (126, 102, 74), bare * 0.75)
+    # Darker swales where the ground held moisture and the grass stayed green
+    # longer, and stone-dry crowns where it did not. Even a cured paddock is
+    # not one colour, and this is the pair that carries the variation.
+    swale = np.clip((noise(size, size / 3.6, rng) - 0.56) * 2.6, 0, 1)
+    img = mix(img, (72, 78, 42), swale * 0.7)
+    crown = np.clip((noise(size, size / 4.2, rng) - 0.62) * 2.8, 0, 1)
+    img = mix(img, (206, 190, 138), crown * 0.55)
+    # Fallen leaf and twig litter - eucalypt forest floor is never clean.
+    litter = np.clip((noise(size, 1.5, rng) - 0.66) * 5.0, 0, 1)
+    return np.clip(mix(img, (74, 66, 44), litter * 0.65), 0, 255)
+
+
+def mineral_earth(size, rng):
+    """The bladed firebreak: soil scraped back to mineral earth.
+
+    A firebreak is not a path, it is the *absence* of fuel - a dozer has taken
+    the grass, the litter and the topsoil off down to subsoil. Which is why
+    this is the one surface here with no organic colour in it at all.
+
+    Kept deliberately grey-ochre rather than the red-orange that subsoil often
+    really is. See the note at the top of this file: this is the largest warm
+    surface in the world and the flames have to win against it.
+    """
+    broad = noise(size, size / 9.0, rng)
+    grain = noise(size, 1.0, rng)
+    img = mix((116, 100, 82), (152, 136, 116), 0.3 + 0.55 * broad)
+    img = img * (0.88 + 0.24 * grain)[..., None]
+    # Blade marks: a graded break carries the arc of the dozer across it.
+    scrape = streaks(size, rng, 9, 5.0, vertical=False)
+    img = img * (0.93 + 0.14 * scrape)[..., None]
+    # Turned clods and stones, lit from one side so they read as lumps rather
+    # than as spots.
+    lumps = noise(size, 2.0, rng)
+    edge = np.clip((lumps - 0.62) * 8.0, 0, 1)
+    lit = np.roll(edge, (-2, -2), (0, 1)) - np.roll(edge, (2, 2), (0, 1))
+    return np.clip(img * (1.0 + 0.26 * lit)[..., None], 0, 255)
+
+
+def burnt_ground(size, rng):
+    """Ash and char: ground that has already been through it.
+
+    Not black. Burnt ground is grey - white-grey ash where the fuel was heavy
+    and it burned out, charcoal where it did not, and the odd unburnt island
+    the fire ran around. The variation is the whole texture; a flat dark patch
+    reads as a hole in the ground rather than as a burn.
+    """
+    patch = noise(size, size / 6.0, rng)
+    fine = noise(size, 1.2, rng)
+    # Paler than this and it reads as concrete rather than as ash, which is
+    # what eight of them in discs round the tree butts looked like. Ash is
+    # grey but it is grey over black, and it always has char showing through.
+    img = mix((30, 26, 24), (104, 98, 90), 0.2 + 0.7 * patch)
+    img = img * (0.82 + 0.32 * fine)[..., None]
+    # Charcoal: the fuel that did not burn out, still standing as black lumps.
+    char = np.clip((noise(size, 1.8, rng) - 0.66) * 5.0, 0, 1)
+    img = mix(img, (24, 21, 20), char * 0.8)
+    # Islands the fire ran past, still carrying cured grass.
+    island = np.clip((noise(size, size / 14.0, rng) - 0.76) * 5.0, 0, 1)
+    return np.clip(mix(img, (128, 112, 74), island * 0.7), 0, 255)
+
+
+def bark_stringy(size, rng):
+    """Stringybark: fibrous, deeply furrowed, grey-brown.
+
+    Half the trees are this and half are smooth-barked gum, because eight
+    trunks of one bark in a 12 m clearing is the same wallpaper problem a row
+    of identical trees has - and at this scale the trunks are most of what the
+    aircraft actually flies past.
+    """
+    fibre = streaks(size, rng, 26, 6.0)
+    furrow = 0.5 + 0.5 * np.sin(
+        np.linspace(0, 2 * np.pi * 9, size)[None, :] * np.ones((size, 1))
+        + noise(size, 4.0, rng) * 7.0)
+    img = mix((56, 46, 38), (118, 102, 84), 0.2 + 0.6 * furrow)
+    img = img * (0.72 + 0.46 * fibre)[..., None]
+    # Deep shadow in the furrows is what makes bark read as depth on what is
+    # geometrically a smooth cylinder.
+    deep = np.clip((furrow - 0.72) * 4.0, 0, 1)
+    img = mix(img, (28, 23, 19), deep * 0.6)
+    return np.clip(img, 0, 255)
+
+
+def bark_smooth(size, rng):
+    """Smooth-barked gum: shed ribbons, patchy cream, grey and dull salmon.
+
+    The salmon is the tricky one - freshly shed gum really is pinkish, and
+    pink is warm-hued. It is kept dull for the reason at the top of the file.
+    """
+    ribbon = streaks(size, rng, 5, 9.0)
+    patch = noise(size, size / 5.0, rng)
+    # Darker than a real smooth gum, and deliberately. At its true value this
+    # came out as a white pole against dark ground - a smooth cylinder with a
+    # pale low-contrast texture has nothing for the eye to catch, so it reads
+    # as painted rather than as bark. Dropping the value and widening the
+    # spread gives the same colour family with something to see on it.
+    img = mix((62, 58, 51), (128, 121, 108), 0.20 + 0.68 * patch)
+    img = img * (0.74 + 0.44 * ribbon)[..., None]
+    # Patches where the old bark has come away, exposing fresh trunk.
+    fresh = np.clip((noise(size, size / 9.0, rng) - 0.55) * 3.0, 0, 1)
+    img = mix(img, (124, 101, 89), fresh * 0.6)
+    # Trailing ribbons of shed bark still hanging on.
+    hang = np.clip((streaks(size, rng, 13, 7.0) - 0.70) * 4.5, 0, 1)
+    img = mix(img, (96, 84, 70), hang * 0.6)
+    return np.clip(img, 0, 255)
+
+
+def char_bark(size, rng):
+    """Fire-scarred bark: the lower trunk of a tree that has burnt before.
+
+    Eucalypt forest is fire country and the trees show it. Blackened butts
+    under living crowns are the detail that says this stand burns regularly
+    rather than that someone dropped a match in a park.
+    """
+    fibre = streaks(size, rng, 22, 5.0)
+    img = mix((26, 22, 20), (72, 64, 58), 0.2 + 0.55 * noise(size, 2.5, rng))
+    img = img * (0.74 + 0.44 * fibre)[..., None]
+    # Grey ash bloom over the char, and a little surviving bark at the edges.
+    bloom = np.clip((noise(size, size / 10.0, rng) - 0.62) * 3.4, 0, 1)
+    img = mix(img, (112, 106, 98), bloom * 0.45)
+    return np.clip(img, 0, 255)
+
+
+def foliage(size, rng, tint=(1.0, 1.0, 1.0)):
+    """Eucalypt crown: olive and blue-grey, sparse, hanging.
+
+    Not a leaf photograph. These are spheres, and one big leaf wrapped round a
+    sphere looks worse than no texture at all. What a canopy needs from two
+    metres below is the right *statistics* - clumps of light and shade at leaf
+    scale, and gaps, so the surface breaks up instead of shading like a
+    billiard ball.
+
+    Feature size is relative to the image because this is mapped ONCE round a
+    sphere rather than tiled across it: tiling a sphere puts seams where the
+    wrap meets itself, and on a 0.5 m ball those seams read as square patches.
+
+    A eucalypt crown is *open* - the leaves hang edge-on and you can see sky
+    through it - which is why the gaps here are wider and darker than an apple
+    canopy's. It is also why the aircraft can be under one and still be lit.
+    """
+    # Contrast is the whole job here and the first version had nowhere near
+    # enough of it. A smoothly shaded sphere with a soft texture on it stays a
+    # sphere no matter what colour it is - it reads as broccoli. What breaks
+    # the ball is hard *dark* structure: deep holes with sharp edges, because
+    # the eye takes a black gap for a hole through the leaves and stops seeing
+    # the surface the gap is painted on.
+    clump = noise(size, size / 7.0, rng)
+    mid = noise(size, size / 18.0, rng)
+    fine = noise(size, 1.2, rng)
+    img = mix((34, 46, 26), (132, 146, 96), 0.12 + 0.52 * clump + 0.38 * mid)
+    img = img * (0.62 + 0.62 * fine)[..., None]
+    # Holes, at two scales, and genuinely dark. A eucalypt crown is mostly sky.
+    big = np.clip((noise(size, size / 11.0, rng) - 0.50) * 3.4, 0, 1)
+    img = mix(img, (14, 18, 13), big * 0.92)
+    small = np.clip((noise(size, size / 34.0, rng) - 0.56) * 5.0, 0, 1)
+    img = mix(img, (18, 24, 17), small * 0.80)
+    # Leaves catching the sun on the outside of the clump.
+    lit = np.clip((noise(size, size / 20.0, rng) - 0.70) * 4.5, 0, 1)
+    img = mix(img, (168, 178, 122), lit * 0.55)
+    # Dead leaf still hanging in the crown - drought-stressed and pre-fire.
+    dead = np.clip((noise(size, size / 16.0, rng) - 0.74) * 4.0, 0, 1)
+    img = mix(img, (136, 112, 62), dead * 0.55)
+    return np.clip(img * np.array(tint), 0, 255)
+
+
+def charred_log(size, rng):
+    """Fallen timber: half-burnt, checked into blocks along the grain."""
+    grain = streaks(size, rng, 30, 4.0)
+    img = mix((44, 36, 30), (96, 84, 70), 0.25 + 0.5 * noise(size, 2.0, rng))
+    img = img * (0.76 + 0.42 * grain)[..., None]
+    # Checking: the square cracks fire opens in a log as it dries and burns.
+    cx = 0.5 + 0.5 * np.sin(np.linspace(0, 2 * np.pi * 7, size)[None, :]
+                            * np.ones((size, 1)) + noise(size, 3.0, rng) * 5)
+    cy = 0.5 + 0.5 * np.sin(np.linspace(0, 2 * np.pi * 4, size)[:, None]
+                            * np.ones((1, size)) + noise(size, 3.0, rng) * 5)
+    crack = np.clip((np.minimum(cx, cy) - 0.60) * 5.0, 0, 1)
+    img = mix(img, (18, 15, 13), crack * 0.85)
+    return np.clip(img, 0, 255)
+
+
+def rock(size, rng):
+    """Granite: the outcrop and the scattered stone."""
+    body = noise(size, size / 8.0, rng)
+    speck = noise(size, 0.8, rng)
+    # Granite is pale, but pale plus smooth plus spherical came out as a
+    # clutch of white eggs sitting on the paddock - the brightest thing in a
+    # frame whose subject is a fire. Dropped well below its true value and
+    # given a wider spread, so it still reads as stone but stops being the
+    # first thing the eye lands on.
+    img = mix((54, 52, 50), (104, 101, 96), 0.25 + 0.65 * body)
+    img = img * (0.86 + 0.28 * speck)[..., None]
+    # Fracture lines, and lichen, which is what stops stone reading as concrete.
+    crack = np.clip((noise(size, 1.6, rng) - 0.74) * 6.0, 0, 1)
+    img = mix(img, (58, 56, 54), crack * 0.7)
+    lichen = np.clip((noise(size, size / 15.0, rng) - 0.70) * 4.0, 0, 1)
+    return np.clip(mix(img, (128, 138, 104), lichen * 0.45), 0, 255)
+
+
+def bund_earth(size, rng):
+    """The pushed-up earth bank round the fire ground.
+
+    Coarser than the graded break: this is spoil, not a surface, so it keeps
+    its clods and the odd buried stump.
+    """
+    # Deliberately free of any directional structure. The first version had a
+    # grain in it, and stretched along a 12 m bank it turned into horizontal
+    # banding that read unmistakably as decking - stacked planks rather than
+    # pushed-up earth. Spoil has no grain, so neither does this.
+    broad = noise(size, size / 4.0, rng)
+    img = mix((66, 56, 45), (118, 103, 85), 0.22 + 0.62 * broad)
+    # Clods, at two scales, each lit from one side so they read as lumps with
+    # a top and a shadow rather than as spots.
+    for sc, amt in ((2.6, 0.34), (1.1, 0.22)):
+        clod = noise(size, sc, rng)
+        edge = np.clip((clod - 0.56) * 6.0, 0, 1)
+        lit = np.roll(edge, (-3, -3), (0, 1)) - np.roll(edge, (3, 3), (0, 1))
+        img = img * (1.0 + amt * lit)[..., None]
+    # Stones turned up by the blade.
+    stone = np.clip((noise(size, 1.4, rng) - 0.74) * 6.0, 0, 1)
+    img = mix(img, (128, 124, 116), stone * 0.6)
+    # Dry grass starting back over an older bank, in clumps not a wash.
+    regrowth = np.clip((noise(size, size / 7.0, rng) - 0.64) * 3.4, 0, 1)
+    return np.clip(mix(img, (120, 106, 66), regrowth * 0.55), 0, 255)
+
+
+# Three crown variants rather than one. Eight trees built from the same handful
+# of primitives in one identical green is the wallpaper problem, and it is more
+# acute here than in an orchard: there are only eight of them and the aircraft
+# fly between them at head height for the whole run.
+FOLIAGE_TINTS = ((1.00, 1.00, 1.00),      # olive
+                 (0.88, 0.96, 1.06),      # blue-grey gum
+                 (1.06, 1.00, 0.86))      # drought-yellowed
+
+LAYERS = {
+    'dry_grass': dry_grass,
+    'mineral_earth': mineral_earth,
+    'burnt_ground': burnt_ground,
+    'bark_stringy': bark_stringy,
+    'bark_smooth': bark_smooth,
+    'char_bark': char_bark,
+    'charred_log': charred_log,
+    'rock': rock,
+    'bund_earth': bund_earth,
+}
+for _i, _t in enumerate(FOLIAGE_TINTS):
+    LAYERS['foliage%d' % _i] = (lambda size, rng, t=_t: foliage(size, rng, t))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--out', default=OUT)
+    ap.add_argument('--size', type=int, default=256)
+    ap.add_argument('--force', action='store_true',
+                    help='write even if a texture would compete with the fire')
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.out):
+        os.makedirs(args.out)
+    rng = np.random.default_rng(SEED)
+
+    bad = []
+    print('%-16s %-18s %-12s %s' % ('texture', 'mean rgb', 'worst warm',
+                                    'reads as flame'))
+    for name in sorted(LAYERS):
+        data = LAYERS[name](args.size, rng)
+        peak = worst_warm_saturation(data)
+        share = flame_like(data)
+        flag = ''
+        if share > 0.0 or peak > FIRE_SAT_MIN:
+            flag = '   <-- COMPETES WITH THE FIRE'
+            bad.append((name, peak, share))
+        mean = data.reshape(-1, 3).mean(axis=0)
+        print('%-16s (%3.0f,%3.0f,%3.0f)      %5.0f/%-4.0f   %.4f%s'
+              % (name, mean[0], mean[1], mean[2], peak, FIRE_SAT_MIN,
+                 share, flag))
+        Image.fromarray(data.astype(np.uint8), 'RGB').save(
+            os.path.join(args.out, name + '.png'), optimize=True)
+
+    if bad and not args.force:
+        print('\nRefusing to leave these as they are: the fires are the only '
+              'saturated warm\nthing in this world, and a ground that glows '
+              'takes that away. Desaturate\nthem or pass --force.')
+        return 1
+    print('\n%d textures -> %s' % (len(LAYERS), args.out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<!-- hector's quadrotor with a scanning laser on a mast above the rotors.
+
+     hector already ships a laser-equipped variant,
+     quadrotor_hokuyo_utm30lx.urdf.xacro, and it is not usable for this. It
+     hangs the Hokuyo upside down 0.097 m *below* base_link, which puts it
+     inside the aircraft: measured on the running model, that scanner returns
+     0.08 m - its own range_min, i.e. a hard self-hit - across the sectors
+     where the landing gear and rotor booms sit. A reactive avoidance filter
+     fed those readings believes it is permanently boxed in and never moves.
+     That variant also carries a 640x480 camera at 30 Hz, which three drones
+     do not need and this machine would rather not render.
+
+     So the laser goes on a mast instead, the way a TurtleBot3 carries its
+     LiDAR. The mast is 0.25 m, and the reason it is that tall rather than just
+     clear of the airframe is the one thing about this that is specific to
+     aircraft: a quadrotor pitches in order to translate. Nothing on this
+     airframe is above z = +0.04, so a 0.12 m mast is clear while hovering
+     level - and useless in flight. The rotor tips are 0.396 m out, so a 15
+     degree pitch swings the far side of the scan plane down by
+     0.396*sin(15) = 0.10 m, straight through the rotor disc. Measured at
+     0.12 m, exactly that happened: the moment a drone accelerated it saw its
+     own booms at 0.40-0.45 m - their tip radius - decided it was boxed in, and
+     latched into the safety filter's full-stop branch permanently.
+
+     0.25 m keeps the plane above the rotors out to about 32 degrees of tilt,
+     well past anything this controller commands. treasure_collector also
+     rejects returns closer than ~min_valid_range as belt and braces, because
+     the tilt during an aggressive recovery is not really bounded.
+
+     Rays are cut from hector's 1081 to 181 and the update rate from 40 Hz to
+     10 Hz. The collector only ever asks this scan for the minimum range in
+     three wide sectors, which 181 rays over 270 degrees resolves to about
+     1.5 degrees - far finer than the question - and three drones scanning at
+     40 Hz is real time the simulation would rather spend on physics. -->
+<robot name="quadrotor" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="M_PI" value="3.1415926535897931" />
+
+  <xacro:include filename="$(find hector_quadrotor_description)/urdf/quadrotor_base.urdf.xacro" />
+  <xacro:quadrotor_base_macro />
+
+  <!-- The mast. Cosmetic - it gives the scanner something to visibly stand on
+       - but it is a real link with a real (tiny) mass, so the inertia the
+       controller reads at startup includes it. -->
+  <link name="laser_mast">
+    <inertial>
+      <mass value="0.01" />
+      <origin xyz="0 0 0" />
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.007" length="0.23" />
+      </geometry>
+      <material name="mast_grey">
+        <color rgba="0.3 0.3 0.32 1.0" />
+      </material>
+    </visual>
+  </link>
+
+  <joint name="laser_mast_joint" type="fixed">
+    <parent link="base_link" />
+    <child  link="laser_mast" />
+    <origin xyz="0 0 0.135" rpy="0 0 0" />
+  </joint>
+
+  <xacro:include filename="$(find hector_sensors_description)/urdf/hokuyo_utm30lx.urdf.xacro" />
+  <xacro:hokuyo_utm30lx name="laser0" parent="base_link" ros_topic="scan"
+                        update_rate="10" ray_count="181"
+                        min_angle="-135" max_angle="135">
+    <origin xyz="0.0 0.0 0.25" rpy="0 0 0" />
+  </xacro:hokuyo_utm30lx>
+
+  <xacro:include filename="$(find hector_quadrotor_gazebo)/urdf/quadrotor_plugins.gazebo.xacro" />
+
+</robot>

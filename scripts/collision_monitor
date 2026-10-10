@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+collision_monitor - measures every way a vehicle in this scenario can hit
+something, and reports which one is actually happening.
+
+"They crash sometimes" is not something the package could previously answer, and
+the three ways it happens need completely different fixes:
+
+  drone <-> drone   the aircraft transit on separate altitude lanes, and the
+                    laser is a horizontal plane on a mast. Two drones on
+                    different lanes are mutually invisible - the scan of the one
+                    below passes under the one above. They are only ever visible
+                    to each other while crossing layers, which is precisely the
+                    manoeuvre that puts them in the same place.
+
+  drone <-> tree    the trunks are visible to the laser, but the three-sector
+                    filter only shapes forward speed and yaw. Station-keeping
+                    commands lateral velocity, so a drone holding position beside
+                    a trunk can drift sideways into it with the filter engaged
+                    and unable to help.
+
+  scout <-> scout   only when ground vehicles are present - uav_scout_bushfire
+                    passes them in ~scouts. Each vehicle's deck is below the
+                    other's scan plane, which is what the visibility poles are
+                    for.
+
+This node lives in uav_bushfire because both packages need it and
+uav_scout_bushfire already depends on this one. Running the same measurement in
+both is the point: the drone-drone and drone-tree failures are inherited, so a
+fix made in one package has to be measurable in the other.
+
+Separations are measured centre-to-centre horizontally and vertically, because a
+contact needs both. An aircraft 0.3 m above another is not touching it, and
+scoring on 3D distance alone reports a clean overflight as a collision - a
+mistake worth avoiding, having made it before in this workspace.
+
+Contacts are edge-triggered: a pair that stays too close is one event, not one
+per sample, or a slow squeeze scores worse than a fast strike.
+
+Subscriptions
+-------------
+  <ns>/ground_truth/state   nav_msgs/Odometry   each aircraft
+  <ns>/odom                 nav_msgs/Odometry   each scout
+
+ROS Parameters (private, ~)
+---------------------------
+  ~drones        list   aircraft namespaces
+  ~scouts        list   ground vehicle namespaces
+  ~obstacles     list   [[x, y, radius], ...] the trees
+  ~rotor_radius  float  aircraft half-span, m               (default 0.40)
+  ~drone_vsep    float  vertical overlap for two aircraft, m(default 0.30)
+  ~scout_radius  float  scout half-diagonal, m              (default 0.45)
+  ~tree_height   float  how high the trunks reach, m        (default 3.00)
+  ~report_period float  seconds between interim lines       (default 20.0)
+"""
+
+import math
+
+import rospy
+from nav_msgs.msg import Odometry
+
+
+BOLD = '\033[1m'
+GREEN = '\033[92m'
+RED = '\033[91m'
+AMBER = '\033[93m'
+CYAN = '\033[96m'
+OFF = '\033[0m'
+
+
+def say(text=''):
+    print(text, flush=True)
+
+
+class Pair(object):
+    """One kind of contact between two named things."""
+
+    def __init__(self, label):
+        self.label = label
+        self.count = 0
+        self.min_gap = float('inf')
+        self.min_at = None
+        self.open = False        # edge trigger
+
+    def update(self, gap, where, threshold):
+        if gap < self.min_gap:
+            self.min_gap = gap
+            self.min_at = where
+        if gap < threshold:
+            if not self.open:
+                self.count += 1
+                self.open = True
+                return True
+        elif gap > threshold + 0.15:
+            self.open = False
+        return False
+
+
+class CollisionMonitor(object):
+
+    def __init__(self):
+        rospy.init_node('collision_monitor')
+
+        self._drones = rospy.get_param('~drones', ['uav_0', 'uav_1', 'uav_2'])
+        # Empty here: uav_bushfire has no ground vehicles. uav_scout_bushfire
+        # runs this same node and passes its two Scouts in.
+        self._scouts = rospy.get_param('~scouts', [])
+        # ~obstacles is the tenders' keep-out list, and it is NOT all trees:
+        # the last entry is the dam, a 1.9 m disc of water that the scouts must
+        # not drive into. It is flat, so aircraft cross it constantly and
+        # legitimately - and counting it as a trunk scored every one of those as
+        # a tree strike, at gaps like -2.04 m that are geometrically impossible
+        # for a 0.35 m trunk. Anything wider than a trunk is ground furniture,
+        # not something an aircraft at altitude can hit.
+        self._max_trunk = rospy.get_param('~max_trunk_radius', 0.60)
+        self._trees = [t for t in rospy.get_param('~obstacles', [])
+                       if t[2] <= self._max_trunk]
+        self._rotor = rospy.get_param('~rotor_radius', 0.40)
+        self._dvsep = rospy.get_param('~drone_vsep', 0.30)
+        self._srad = rospy.get_param('~scout_radius', 0.45)
+        self._tree_h = rospy.get_param('~tree_height', 3.00)
+        period = rospy.get_param('~report_period', 20.0)
+
+        self._pose = {}
+        self._pairs = {}
+
+        for ns in self._drones:
+            rospy.Subscriber('/%s/ground_truth/state' % ns, Odometry,
+                             self._odom, ns, queue_size=1)
+        for ns in self._scouts:
+            rospy.Subscriber('/%s/odom' % ns, Odometry, self._odom, ns,
+                             queue_size=1)
+
+        rospy.Timer(rospy.Duration(period), self._interim)
+        rospy.on_shutdown(self._final)
+        rospy.loginfo('[COLLIDE] watching %d aircraft, %d scouts, %d trees',
+                      len(self._drones), len(self._scouts), len(self._trees))
+
+    def _pair(self, key):
+        if key not in self._pairs:
+            self._pairs[key] = Pair(key)
+        return self._pairs[key]
+
+    def _odom(self, msg, ns):
+        p = msg.pose.pose.position
+        self._pose[ns] = (p.x, p.y, p.z)
+        self._check(ns)
+
+    def _check(self, ns):
+        me = self._pose.get(ns)
+        if me is None:
+            return
+        x, y, z = me
+
+        if ns in self._drones:
+            # Against other aircraft. Both a horizontal and a vertical overlap
+            # are required: rotor discs at the same height 0.5 m apart are a
+            # strike, the same discs 0.5 m apart vertically are not.
+            for other in self._drones:
+                if other == ns or other not in self._pose:
+                    continue
+                if other < ns:
+                    continue        # each pair once
+                ox, oy, oz = self._pose[other]
+                h = math.hypot(x - ox, y - oy)
+                v = abs(z - oz)
+                # Vertically clear counts as clear. Reported as the raw
+                # horizontal distance so the latch resets, rather than skipping
+                # the update entirely - skipping leaves the latch stuck open and
+                # the next real approach goes uncounted.
+                gap = h if v > self._dvsep else h - 2.0 * self._rotor
+                pr = self._pair('drone-drone %s|%s' % (ns, other))
+                if pr.update(gap, (x, y, z), 0.0):
+                    rospy.logwarn('[COLLIDE] %s <-> %s at %.2f m horizontal, '
+                                  '%.2f m vertical, (%.1f, %.1f, %.1f)',
+                                  ns, other, h, v, x, y, z)
+
+            # Against the trunks. Only while inside the trunk's height band -
+            # an aircraft above the canopy is not in contact with the tree.
+            #
+            # The MINIMUM over all trees, updated once. One Pair per drone was
+            # shared across the whole loop in the first version, so a distant
+            # trunk reset the latch and the next near one re-triggered it, once
+            # per tree per sample: 19 trees turned a handful of real contacts
+            # into 1799 "events". The number was nonsense and so was any
+            # conclusion drawn from it.
+            if z <= self._tree_h and self._trees:
+                best, where = None, None
+                for t in self._trees:
+                    tx, ty, tr = t[0], t[1], t[2]
+                    g = math.hypot(x - tx, y - ty) - tr - self._rotor
+                    if best is None or g < best:
+                        best, where = g, (tx, ty)
+                pr = self._pair('drone-tree %s' % ns)
+                if pr.update(best, (x, y, z), 0.0):
+                    rospy.logwarn('[COLLIDE] %s <-> tree at (%.1f, %.1f), '
+                                  'gap %.2f m, alt %.2f', ns, where[0],
+                                  where[1], best, z)
+
+        if ns in self._scouts:
+            for other in self._scouts:
+                if other == ns or other not in self._pose:
+                    continue
+                if other < ns:
+                    continue
+                ox, oy, _ = self._pose[other]
+                gap = math.hypot(x - ox, y - oy) - 2.0 * self._srad
+                pr = self._pair('scout-scout %s|%s' % (ns, other))
+                if pr.update(gap, (x, y, 0.0), 0.0):
+                    rospy.logwarn('[COLLIDE] %s <-> %s at %.2f m', ns, other,
+                                  gap + 2.0 * self._srad)
+
+    def _interim(self, _):
+        tot = sum(p.count for p in self._pairs.values())
+        if tot:
+            worst = min((p.min_gap, p.label) for p in self._pairs.values()
+                        if p.min_gap != float('inf'))
+            rospy.loginfo('[COLLIDE] %d contact event(s) so far; closest %.2f m'
+                          ' (%s)', tot, worst[0], worst[1])
+
+    def _final(self):
+        groups = {'drone-drone': [], 'drone-tree': [], 'scout-scout': []}
+        for key, p in self._pairs.items():
+            for g in groups:
+                if key.startswith(g):
+                    groups[g].append(p)
+        say('')
+        say('%s  === collisions ==============================================%s'
+            % (BOLD, OFF))
+        total = 0
+        for g in ('drone-drone', 'drone-tree', 'scout-scout'):
+            ps = [p for p in groups[g] if p.min_gap != float('inf')]
+            if not ps:
+                say('   %-12s no data' % g)
+                continue
+            n = sum(p.count for p in ps)
+            total += n
+            worst = min(ps, key=lambda q: q.min_gap)
+            col = RED if n else GREEN
+            say('   %-12s %s%d contact event(s)%s, closest gap %s%+.2f m%s'
+                % (g, col, n, OFF, CYAN, worst.min_gap, OFF))
+            if worst.min_at:
+                say('                at (%.1f, %.1f, %.1f)  [%s]'
+                    % (worst.min_at[0], worst.min_at[1], worst.min_at[2],
+                       worst.label))
+        say('')
+        say('   %stotal %d contact event(s)%s'
+            % (RED if total else GREEN, total, OFF))
+        say('')
+
+
+def main():
+    CollisionMonitor()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

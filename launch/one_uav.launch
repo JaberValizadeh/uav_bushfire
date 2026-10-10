@@ -1,0 +1,196 @@
+<?xml version="1.0"?>
+<!-- One aircraft: the airframe, a suppressor, a monitor.
+
+     Included three times by bushfire.launch with a different ns and start
+     position. Note what is *not* here any more - the fire ground. The treasure
+     version gave every drone its own spawner inside this file, because every
+     drone had its own private target; fires are shared and their value is
+     split between whoever chose them, so fire_spotter is started once by the
+     parent launch outside every namespace.
+
+     The choice of fire, though, does live here: the suppressor reads the whole
+     board and claims what it wants. Only the two topics it shares with the
+     fleet - /bushfire/hotspots and /bushfire/claims - are global.
+
+     Everything here is inside the caller's <group ns="...">, so every topic,
+     service and parameter is namespaced by construction: /uav_0/cmd_vel,
+     /uav_0/engage, /uav_0/scan, /uav_0/bushfire/target. hector's plugins take
+     the namespace from the enclosing group without being told, which is what
+     makes three of them in one Gazebo possible at all. -->
+<launch>
+  <arg name="ns" doc="Namespace and Gazebo model name, e.g. uav_0" />
+  <arg name="x" default="0.0" />
+  <arg name="y" default="0.0" />
+  <arg name="z" default="0.3" />
+
+  <arg name="cruise_altitude" />
+  <arg name="drop_altitude" />
+  <arg name="linear_speed" />
+  <arg name="angular_gain" />
+  <arg name="avoid_dist" />
+  <arg name="stop_dist" />
+  <arg name="arrive_radius" />
+  <!-- The other aircraft, so this one can keep clear of them. Needed because
+       the laser is a horizontal plane on a mast: it sees another drone at the
+       same height and not at all when one is above or below, which is exactly
+       the geometry of a descent through somebody else's transit. -->
+  <!-- This aircraft's transit lane. Lane 0 flies at cruise_altitude, each
+       lane above it cruise_step higher, so the three of them are 0.45 m apart
+       in transit - more than peer_vsep, which is what stops the peer filter
+       engaging on aircraft that are correctly separated by design. -->
+  <!-- The trunks, so the governor can refuse a command that would end inside
+       one. The suppressor cannot get this from its laser: it needs positions
+       to predict against, not a range reading. Same list the spotter gets. -->
+  <arg name="obstacle_file" default="" />
+  <arg name="rotor_radius" default="0.40" />
+  <arg name="hard_margin" default="0.15" />
+  <arg name="govern_lookahead" default="0.4" />
+
+  <arg name="cruise_step" default="0.45" />
+  <arg name="lane_index" default="0" />
+
+  <arg name="peers" default="[uav_0, uav_1, uav_2]" />
+  <arg name="peer_radius" default="1.20" />
+  <arg name="peer_vsep" default="0.35" />
+  <arg name="peer_push" default="0.60" />
+
+  <arg name="max_crew" default="3" />
+  <arg name="join_deadline" default="0.7" />
+
+  <!-- The airframe, its plugins and controller/twist, from hector's own spawn
+       launch with the model swapped for the laser-mast variant in this
+       package. name and tf_prefix must both be the namespace or the three
+       drones collide in Gazebo's model list and on TF. -->
+  <include file="$(find hector_quadrotor_gazebo)/launch/spawn_quadrotor.launch">
+    <arg name="name"      value="$(arg ns)" />
+    <arg name="tf_prefix" value="$(arg ns)" />
+    <arg name="model"     value="$(find uav_bushfire)/urdf/quadrotor_laser_mast.gazebo.xacro" />
+    <arg name="x"         value="$(arg x)" />
+    <arg name="y"         value="$(arg y)" />
+    <arg name="z"         value="$(arg z)" />
+  </include>
+
+  <!-- Off, and in this scenario it is not close to optional. auto_engage cuts
+       the motors when it sees a commanded descent that is not being achieved,
+       which is landing detection - and the DESCEND phase is a commanded
+       descent onto the ground, held there. fire_suppressor calls /engage once
+       instead, and /shutdown deliberately during a respawn. -->
+  <param name="controller/twist/auto_engage" value="false" type="bool" />
+
+  <node pkg="uav_bushfire" type="pose_fire_monitor" name="pose_fire_monitor"
+        output="screen"
+        launch-prefix="bash -c 'sleep 12 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="pose_log_hz" value="0.25" />
+  </node>
+
+  <node pkg="uav_bushfire" type="fire_suppressor" name="fire_suppressor"
+        output="screen"
+        launch-prefix="bash -c 'sleep 14 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="cruise_altitude" value="$(arg cruise_altitude)" />
+    <!-- Only a fallback now: the spotter sends a station with every tasking,
+         including its altitude, because crew members are stacked. This is what
+         a lone drone's station comes out at, and what is used if a tasking
+         ever arrives without one. Must stay comfortably under the spotter's
+         suppress_altitude, or the drone hovers above the threshold and never
+         registers as bombing. -->
+    <param name="drop_altitude"   value="$(arg drop_altitude)" />
+    <!-- Do not bid on a fire that already has this many drones on it. The
+         spotter enforces the same cap; this only saves a claim that would be
+         refused, and keeps the drone's own share arithmetic honest. -->
+    <rosparam if="$(eval obstacle_file != '')"
+              file="$(arg obstacle_file)" command="load" />
+    <param name="rotor_radius"    value="$(arg rotor_radius)" />
+    <param name="hard_margin"     value="$(arg hard_margin)" />
+    <param name="govern_lookahead" value="$(arg govern_lookahead)" />
+    <param name="cruise_step"     value="$(arg cruise_step)" />
+    <param name="lane_index"      value="$(arg lane_index)" />
+    <rosparam param="peers" subst_value="true">$(arg peers)</rosparam>
+    <param name="peer_radius"     value="$(arg peer_radius)" />
+    <param name="peer_vsep"       value="$(arg peer_vsep)" />
+    <param name="peer_push"       value="$(arg peer_push)" />
+    <param name="max_crew"        value="$(arg max_crew)" />
+    <!-- Nor one already this far through its work. Both caps are mirrored from
+         the spotter, which is the one that actually enforces them; having them
+         here as well only saves a claim that would be refused, and keeps the
+         drone's own share arithmetic from preferring a fire it cannot have. -->
+    <param name="join_deadline"   value="$(arg join_deadline)" />
+    <!-- How often the board is re-read and a choice made. Twice a second is
+         plenty: the decision is only taken when the drone owes nobody
+         anything, and it is binding once accepted. -->
+    <param name="choose_hz"       value="2.0" />
+    <!-- A claim can be refused - the crew filled up while the board was in
+         flight - and nothing answers it directly, so it is re-sent until a
+         tasking comes back and re-decided after this long. -->
+    <param name="claim_timeout"   value="3.0" />
+    <!-- ...and in the other direction, taskings arriving at 10 Hz are what
+         prove the commitment still stands. Silence for this long means the
+         spotter has taken the fire back (its commit_timeout), and the drone
+         should stop flying at something that is no longer its. -->
+    <param name="target_timeout"  value="2.0" />
+    <!-- The floor for every commanded altitude. The laser is horizontal and
+         sees nothing below the aircraft, so this number is the only thing
+         between a descent and the ground. -->
+    <param name="min_altitude"    value="0.7" />
+    <param name="linear_speed"    value="$(arg linear_speed)" />
+    <param name="vertical_speed"  value="0.6" />
+    <param name="arrive_radius"   value="$(arg arrive_radius)" />
+    <param name="climb_tol"       value="0.20" />
+    <!-- Station-keeping over the fire. Gentle on purpose: this is the one
+         phase that commands lateral velocity, and a drone that darts sideways
+         at low level near trees is a drone about to be respawned. -->
+    <param name="station_gain"    value="1.2" />
+    <param name="station_speed"   value="0.6" />
+    <param name="angular_gain"    value="$(arg angular_gain)" />
+    <param name="max_angular"     value="1.5" />
+    <param name="angle_tol"       value="0.12" />
+    <param name="slow_dist"       value="1.0" />
+    <param name="avoid_dist"      value="$(arg avoid_dist)" />
+    <param name="stop_dist"       value="$(arg stop_dist)" />
+    <!-- The scan is trusted down to the sensor's own floor, because a trunk
+         the drone is already touching reads at 0.33 m and must not be filtered
+         away. Self-hits off the rotors are rejected by tilt instead: past
+         self_hit_tilt the mast no longer holds the scan plane above the rotor
+         discs, and only then is anything inside self_hit_range dropped. -->
+    <param name="min_valid_range" value="0.15" />
+    <param name="self_hit_range"  value="0.50" />
+    <param name="self_hit_tilt"   value="0.50" />
+    <!-- Reverse out when fully blocked, rather than only spinning: a drone
+         pinned against a trunk has no clear heading to turn to. -->
+    <param name="back_off_speed"  value="0.35" />
+    <!-- Commit to a deflection for a moment after the front sector clears.
+         Without it the drone re-aims the instant it is past, turns back into
+         the tree and never gets by - see the suppressor's CHASE branch. -->
+    <param name="avoid_hold"      value="1.5" />
+    <!-- Every horizontal command, including station keeping and backing out,
+         must be backed by a current lidar sector.  A lost scan stops lateral
+         flight until the scanner is publishing again. -->
+    <param name="scan_timeout"    value="0.40" />
+    <!-- Geofence. Soft at 4.8 turns the drone round while it is still on the
+         fire ground: fires are only ever lit inside 4.0, and the graded break
+         starts at 4.6, so a drone past 4.8 has already finished whatever it
+         was doing. Past the hard limit, or tilted past upset_angle, it is
+         respawned at its launch point.
+
+         This IS the containment, and it always was. There used to be a 3 m
+         wall at 6.0 as well, and it is gone - partly because a walled box was
+         most of why the world looked artificial, and partly because it was
+         never doing this job: the suppressor's own header records uav_1
+         going over one at 3.5 m and still accelerating 275 m away. A geofence
+         that teleports the aircraft back cannot be flown over.
+
+         Necessary because auto_engage:=false above also disables hector's
+         flip-over motor cut - see the suppressor's header. The world's
+         surrounding bush starts outside fence_hard_size for the same reason;
+         make_bushfire_world refuses to write it any closer. -->
+    <param name="fence_half_size" value="6.8" />
+    <param name="fence_hard_size" value="10.0" />
+    <param name="fence_max_alt"   value="4.0" />
+    <param name="upset_angle"     value="1.05" />
+    <param name="settle_time"     value="1.5" />
+    <param name="start_x"         value="$(arg x)" />
+    <param name="start_y"         value="$(arg y)" />
+    <param name="control_hz"      value="20.0" />
+    <param name="status_hz"       value="1.0" />
+  </node>
+
+</launch>

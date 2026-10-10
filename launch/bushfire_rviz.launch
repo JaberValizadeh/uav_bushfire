@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!--
+  bushfire_rviz.launch
+  ====================
+  Step 3 of 3: the incident as a diagram rather than a picture.
+
+    roslaunch uav_bushfire bushfire_rviz.launch
+
+  Attaches to an incident that is already running. Nothing here publishes to the
+  scenario - it subscribes and draws - so it can be started, killed and started
+  again at any point in a run without disturbing Gazebo or the fleet.
+
+  bushfire.launch includes this when rviz:=true, so there is one definition of
+  the view rather than two that drift.
+
+  Shows the fire ground markers (each fire sized and coloured by its intensity,
+  which is also its value), the three aircraft, and their laser scans.
+-->
+<launch>
+
+  <arg name="rviz_config" default="$(find uav_bushfire)/rviz/bushfire.rviz" />
+  <arg name="delay" default="0"
+       doc="bushfire.launch waits for the world; started by hand, do not" />
+
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(arg rviz_config)"
+        output="screen" required="false"
+        launch-prefix="bash -c 'sleep $(arg delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --" />
+
+</launch>

@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+"""
+fire_suppressor - autonomous water-bombing controller for one drone.
+
+Chooses a fire to work, flies to it, gets down onto it and stays there until it
+is out, then climbs away and chooses again. The transit half of this is the
+reactive laser controller the treasure version of this package used, largely
+unchanged and for the same reasons; the ending is different, and the difference
+is the scenario.
+
+Algorithm
+---------
+  TAKEOFF - engage the motors and climb to cruise_altitude. A ground robot is
+            always ready to drive; this one has to get airborne first, and
+            nothing else can happen until it has.
+  ALIGN   - yaw in place until the drone is facing its station.
+  CHASE   - fly forward along the current heading at cruise altitude, with
+            proportional yaw correction. Speed is scaled down inside slow_dist
+            and further reduced by the safety filter near obstacles.
+  DESCEND - overhead the fire: stop flying forward, hold the station and come
+            down to it. This is where the work happens, and it is held until
+            the spotter says the fire is out - which for a big fire with no
+            crew is a long time.
+  CLIMB   - back to cruise altitude before going anywhere.
+  WAIT    - a couple of ticks after a drop, so the next choice is made from a
+            board that already reflects the fire that just went out.
+
+Choosing a fire
+---------------
+Nobody hands this drone a job any more. fire_spotter publishes the whole board
+on /bushfire/hotspots - every fire's position, value, work remaining and crew -
+and this node picks one and says so on /bushfire/claims.
+
+What it maximises is share per second, not value and not distance:
+
+    n      = crew + 1                     (me, joining)
+    share  = intensity / n                (paid equally to everyone who chose)
+    eta    = travel + work_left / n       (n drones do n seconds per second)
+    utility= share / eta
+
+Both halves of a crew matter and they pull opposite ways. Joining halves the
+payout, and it also halves the time - so on a small fire joining is pointless,
+and on a big one it is the best thing available to everybody, which is how
+bigger fires end up with bigger crews without anything in the code saying so.
+Distance enters as travel time in the denominator rather than as a rule, so a
+nearer fire wins ties and a fire across the arena has to be worth the flight.
+
+Having chosen, the drone is committed: the spotter ignores its claims on
+anything else until the fire is out. That rule is not a restriction on this
+node so much as the thing that makes its own arithmetic true - an `eta`
+computed from a crew of three is a lie if two of them can leave.
+
+The claim is re-sent until a tasking comes back, because a claim can be refused
+(the crew was full) and because it can simply be dropped. If nothing comes back
+within ~claim_timeout the drone picks again from a fresher board, which handles
+both cases with the same code. In the other direction, taskings arriving is
+what proves the commitment still exists: if they stop for ~target_timeout the
+drone considers itself released - that is how it learns the spotter dropped it
+for not turning up.
+
+Where the drone actually stops
+------------------------------
+Not over the fire, unless it is alone on it. The spotter gives each crew member
+a station - a slot on a ring around the fire, at its own altitude - and sends
+it in station_x/y/z on every tasking. Two aircraft station-keeping on the same
+point is a collision, and with crews that is no longer a coincidence to be
+tolerated but the normal case. So CHASE flies at the station, DESCEND holds the
+station, and the fire's own x/y is used only for the display and for the
+heading the drone is roughly pointed along.
+
+The station moves when the crew changes size. That is handled by station-
+keeping already doing what it does - the error simply steps - and it is another
+reason DESCEND is a position controller rather than an arrival test.
+
+Why the last three phases exist
+-------------------------------
+A floating treasure was collected by arriving at a point in the air, so the
+chase ended when the drone got there and altitude was just another axis of the
+same approach. A fire is on the ground and cannot be flown to - the aircraft
+would have to land on it. So arrival and suppression come apart into two
+phases: CHASE ends overhead, at cruise, and then the drone has to descend
+through the last metre and a half onto a target it is now directly above.
+
+That descent cannot be flown body-forward the way CHASE is, because "forward"
+is not a useful direction when the error is 20 cm in an arbitrary bearing and
+the drone is not yawing any more. DESCEND rotates the world-frame position
+error into the body frame and commands both linear.x and linear.y, which is
+proper station-keeping. It is the one place this node uses lateral velocity,
+and it is safe to do it here precisely because the drone is stationary over an
+assigned fire that the spotter placed clear of the trees - the laser's sectors
+stop meaning anything when the aircraft translates sideways, which is why
+CHASE never does it.
+
+CLIMB is not decoration either. Leaving at drop altitude means crossing the
+fire ground at 1.0 m, under the height the geofence and the avoidance were
+tuned for, and into whatever the next fire is next to.
+
+Which frame /cmd_vel is in
+--------------------------
+The body one, yaw-stabilized. This is worth stating flatly because getting it
+wrong is silent and fatal, and this package had it wrong: TwistController's
+cmd_vel callback sets
+
+    command_given_in_stabilized_frame_ = true;      // twist_controller.cpp:139
+
+and update() then rotates the command by the current yaw before using it. Only
+the command/twist topic - which nothing here publishes - is taken in the world
+frame.
+
+So a command of (speed, 0) means "forward", whatever the drone is pointed at.
+Building the command as (speed*cos(yaw), speed*sin(yaw)) - which is what a
+world-frame interface would want - gets rotated by yaw a second time and flies
+the aircraft along 2*yaw. That is not a wobble: at yaw 95 degrees the drone
+travels at 190, i.e. backwards and sideways, with its laser pointed at empty
+air. Measured that exactly - a drone yawed to 94.7 degrees moving along 215 -
+before this was found, and the whole fleet spent every run grinding into walls
+it was not looking at and scoring nothing.
+
+Everything this node publishes is therefore body-frame: linear.x is forward,
+linear.y is unused, and linear.z is untouched by the transform and so is the
+same in either frame.
+
+Why ALIGN exists on an aircraft
+-------------------------------
+Given the above it is not optional, but the reason is the laser rather than the
+frame. The scanner is bolted to the airframe, so its "front" sector only means
+"where I am going" if the drone is pointed where it is going. ALIGN is what
+keeps those two the same thing; CHASE then flies body-forward and the safety
+filter's three sectors mean what their names say.
+
+Geofence and rescue
+-------------------
+A drone that is upset - clipped a tree, caught another drone's downwash - does
+not recover on its own here, and the reason is worth writing down. The launch
+sets hector's auto_engage false, and in this scenario that is not optional at
+all: auto_engage cuts the motors when it sees a commanded descent that is not
+being achieved, which is landing detection, and DESCEND is a commanded descent
+onto the ground held for as long as it takes. But twist_controller.cpp nests
+its flip-over check *inside* the same auto_engage block:
+
+    if (auto_engage_) {
+      ...
+      if (motors_running_ && load_factor < 0.0) {   // flip over?
+        motors_running_ = false;
+
+so turning the one off turns the other off with it. An inverted aircraft then
+keeps full thrust pointing wherever its rotors happen to face and leaves. That
+is not a hypothetical: uav_1 clipped a wall, went over it at 3.5 m, and was
+still accelerating 275 m away with the motors running when the run ended.
+
+So there are two fences. Outside fence_half_size the drone stops working the
+fire and flies back to the middle - an ordinary soft geofence. Past
+fence_hard_size, or tilted past upset_angle, it is no longer a control problem,
+and the drone is teleported back to its launch point with
+/gazebo/set_model_state and re-engaged. Respawning is the honest fix in a
+simulator: there is no attitude recovery to write, because the controller that
+would fly it is the one that has already lost the aircraft.
+
+A respawn has to cut the motors on the way past, not just move the aircraft.
+TwistController only clears its PID integrators in the branch it takes when the
+motors are *not* running, so with auto_engage off there is no path that ever
+resets them. Teleporting alone leaves the attitude loop wound up against the
+tumble it was fighting a moment ago, and it spends that integral on the
+freshly-levelled aircraft and puts it straight back over. That is a respawn
+loop, and it is self-sustaining: 53 rescues in 90 seconds, none of which flew.
+So the order is /shutdown, teleport, settle, /engage - the shutdown is what
+makes the reset happen. Rescues are also rate-limited by settle_time, because
+a drone that has just been dropped in bounces on its landing gear and the
+attitude that produces is not an upset.
+
+What the laser cannot see
+-------------------------
+It is a horizontal 270-degree plane. It says nothing about what is above or
+below the aircraft, so altitude is flown open-loop with respect to obstacles
+and only min_altitude keeps it off the ground. That is survivable here because
+the trees are vertical and their trunks run the full height the drone flies at,
+so anything it could hit, it can also see - which is exactly why the canopies
+in worlds/bushfire.world carry no collision geometry. A scene with real
+overhanging branches would need a sensor this aircraft does not have.
+
+It also means the descent is blind downwards. Nothing stops the drone flying
+into the ground except drop_altitude and min_altitude being honest numbers, so
+DESCEND clamps against min_altitude like every other phase rather than
+commanding its way to zero.
+
+Self-hits, and why the filter for them is conditional
+-----------------------------------------------------
+Past about 32 degrees of tilt the scan plane dips through the rotor discs and
+the drone sees its own booms at their tip radius, ~0.40 m (the mast height in
+urdf/quadrotor_laser_mast.gazebo.xacro is where that number comes from). Read
+as obstacles those returns mean "boxed in", and the aircraft stops for good.
+
+The obvious guard - drop everything closer than 0.55 m - is worse than the
+disease, because it is precisely the range at which this drone gets into
+trouble. Jammed against a tree the laser reads 0.33 m; wedged in a corner,
+0.24 m. Both are below the threshold, so both are discarded, and a drone in
+contact with a wall sees a clear path through it and holds full forward thrust
+against it until it tips over. Two of the three drones ended a run that way.
+
+So the rejection is conditional on the thing that causes it. Tilt is known -
+it is in the same odometry the controller already reads - and below
+self_hit_tilt the plane is provably above the rotors, so returns are trusted
+down to the sensor floor. Above it, returns inside self_hit_range are dropped.
+The drone is briefly blind while recovering hard, which is the one moment it is
+not steering by the laser anyway.
+
+Subscriptions
+-------------
+  ground_truth/state      nav_msgs/Odometry          Drone pose + velocity
+  bushfire/target         uav_bushfire/Hotspot       This drone's job
+  /bushfire/hotspots      uav_bushfire/HotspotArray  The board, to choose from
+  scan                    sensor_msgs/LaserScan      Hokuyo, on the mast
+
+Publications
+------------
+  cmd_vel                 geometry_msgs/Twist        Body-frame velocity (~20 Hz)
+  /bushfire/claims        uav_bushfire/FireClaim     The fire it has chosen
+
+Services used
+-------------
+  engage                  std_srvs/Empty         Spin the motors up
+  shutdown                std_srvs/Empty         Cut them, to clear the PIDs
+
+ROS Parameters (private, ~)
+---------------------------
+  ~cruise_altitude float  Transit altitude, m                (default 1.6)
+  ~drop_altitude   float  Fallback bombing height if the
+                          spotter sends no station, m        (default 0.95)
+  ~max_crew        int    Do not claim a fire that already
+                          has this many drones on it         (default 3)
+  ~join_deadline   float  ...nor one already this far
+                          through its work, as a fraction    (default 0.7)
+  ~choose_hz       float  Rate the board is re-read at (Hz)  (default 2.0)
+  ~external_tasking bool  Do not bid; let an external allocator
+                          claim fires for this aircraft       (default false)
+  ~claim_timeout   float  Re-pick if a claim goes unanswered
+                          for this long, s                   (default 3.0)
+  ~target_timeout  float  Consider a commitment released if
+                          taskings stop for this long, s     (default 2.0)
+  ~min_altitude    float  Never command below this, m        (default 0.7)
+  ~linear_speed    float  Max forward speed (m/s)            (default 1.2)
+  ~vertical_speed  float  Max climb/descent rate (m/s)       (default 0.6)
+  ~station_gain    float  P-gain for holding over a fire     (default 1.2)
+  ~station_speed   float  Speed cap while station-keeping    (default 0.6)
+  ~angular_gain    float  P-gain for heading error           (default 2.0)
+  ~max_angular     float  Yaw rate cap (rad/s)               (default 1.5)
+  ~angle_tol       float  Heading tolerance (rad)            (default 0.12)
+  ~slow_dist       float  Begin slowing at this dist (m)     (default 1.0)
+  ~arrive_radius   float  Switch to DESCEND inside this, m   (default 0.70)
+  ~climb_tol       float  Cruise reached within this, m      (default 0.20)
+  ~avoid_dist      float  Avoidance activation range (m)     (default 1.6)
+  ~stop_dist       float  Full-stop obstacle range (m)       (default 0.9)
+  ~min_valid_range float  Sensor floor; drop returns below   (default 0.15)
+  ~self_hit_range  float  Drop returns below this when tilted(default 0.50)
+  ~self_hit_tilt   float  Tilt at which the mast stops
+                          clearing the rotors, rad           (default 0.50)
+  ~back_off_speed  float  Reverse speed when fully blocked   (default 0.35)
+  ~avoid_hold      float  Stay committed to a deflection for
+                          this long after it clears, s       (default 1.5)
+  ~scan_timeout    float  Refuse horizontal motion when the lidar is older
+                          than this, s                       (default 0.40)
+  ~fence_half_size float  Soft geofence half-width, m        (default 4.8)
+  ~fence_hard_size float  Respawn beyond this half-width, m  (default 8.0)
+  ~fence_max_alt   float  Respawn above this altitude, m     (default 4.0)
+  ~upset_angle     float  Respawn past this roll/pitch, rad  (default 1.05)
+  ~settle_time     float  Ignore upsets for this long after
+                          a respawn, s                       (default 1.5)
+  ~start_x         float  Launch point, for respawns         (default 0.0)
+  ~start_y         float  Launch point, for respawns         (default 0.0)
+  ~control_hz      float  Control loop rate (Hz)             (default 20.0)
+  ~status_hz       float  Status display rate (Hz)           (default 2.0)
+"""
+
+import math
+
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from std_srvs.srv import Empty
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import SetModelState
+from tf.transformations import euler_from_quaternion
+
+from uav_bushfire.msg import Hotspot, HotspotArray, FireClaim
+
+_RESET  = '\033[0m'
+_BOLD   = '\033[1m'
+_YELLOW = '\033[93m'
+_GREEN  = '\033[92m'
+_CYAN   = '\033[96m'
+_RED    = '\033[91m'
+_WHITE  = '\033[97m'
+
+
+def _bar(value, max_value=10.0, width=10):
+    filled = round(width * value / max(max_value, 1))
+    return _GREEN + '#' * filled + _RESET + '-' * (width - filled)
+
+
+def _normalize_angle(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class FireSuppressor:
+
+    def __init__(self):
+        rospy.init_node('fire_suppressor', anonymous=False)
+
+        self._ns = rospy.get_namespace().strip('/') or 'uav'
+
+        # Peer separation. The bubble is a little over two rotor spans so the
+        # push starts before contact; the vertical gate keeps aircraft at
+        # genuinely different heights from fighting each other.
+        # The trunks. This node cannot find them by laser far enough ahead to
+        # plan around, and the governor needs their positions rather than a
+        # range reading, so it is told - from the same list the spotter gets.
+        self._obstacles   = rospy.get_param('~obstacles', [])
+        self._rotor       = rospy.get_param('~rotor_radius', 0.40)
+        self._hard_margin = rospy.get_param('~hard_margin', 0.15)
+        self._govern_dt   = rospy.get_param('~govern_lookahead', 0.4)
+        self._peer_radius = rospy.get_param('~peer_radius', 1.20)
+        self._peer_vsep   = rospy.get_param('~peer_vsep',   0.35)
+        self._peer_push   = rospy.get_param('~peer_push',   0.60)
+        # This drone's transit lane: ~cruise_altitude for lane 0, plus
+        # ~cruise_step for each lane above it.
+        #
+        # Without lanes all three aircraft transit at one height, and then two
+        # things go wrong at once. They are permanently inside each other's
+        # peer bubble, so _peer_filter fights every transit instead of only the
+        # encounters that matter; and the only thing keeping them apart is a
+        # laser that sees a drone dead ahead but not one converging from the
+        # side. Measured at a shared altitude: 8 contact events in two minutes,
+        # against 3 in four with the push disabled - the push was making it
+        # worse, because it was never off.
+        #
+        # The band is narrow and both edges are real. Below ~suppress_altitude
+        # (1.45) a transiting drone registers as bombing whatever it flies over.
+        # Above 2.75 the mast, which sits 0.25 m over the airframe, clears the
+        # 3 m trunks - and an aircraft whose scan plane is above the trees
+        # cannot see them at all.
+        cruise_step        = rospy.get_param('~cruise_step', 0.45)
+        self._lane_i       = int(rospy.get_param('~lane_index', 0))
+        self._cruise_alt   = (rospy.get_param('~cruise_altitude', 1.6)
+                              + cruise_step * self._lane_i)
+        self._drop_alt     = rospy.get_param('~drop_altitude',   0.95)
+        self._min_alt      = rospy.get_param('~min_altitude',    0.7)
+        self._lin_speed    = rospy.get_param('~linear_speed',    1.2)
+        self._vert_speed   = rospy.get_param('~vertical_speed',  0.6)
+        self._stn_gain     = rospy.get_param('~station_gain',    1.2)
+        self._stn_speed    = rospy.get_param('~station_speed',   0.6)
+        self._ang_gain     = rospy.get_param('~angular_gain',    2.0)
+        self._max_ang      = rospy.get_param('~max_angular',     1.5)
+        self._angle_tol    = rospy.get_param('~angle_tol',       0.12)
+        self._slow_dist    = rospy.get_param('~slow_dist',       1.0)
+        self._arrive_rad   = rospy.get_param('~arrive_radius',   0.70)
+        self._climb_tol    = rospy.get_param('~climb_tol',       0.20)
+        self._avoid_dist   = rospy.get_param('~avoid_dist',      1.6)
+        self._stop_dist    = rospy.get_param('~stop_dist',       0.9)
+        self._min_range    = rospy.get_param('~min_valid_range', 0.15)
+        self._self_hit     = rospy.get_param('~self_hit_range',  0.50)
+        self._self_hit_tilt = rospy.get_param('~self_hit_tilt',  0.50)
+        self._back_off     = rospy.get_param('~back_off_speed',  0.35)
+        self._avoid_hold   = rospy.get_param('~avoid_hold',      1.5)
+        self._scan_timeout = rospy.get_param('~scan_timeout',    0.40)
+        self._fence        = rospy.get_param('~fence_half_size', 4.8)
+        self._fence_hard   = rospy.get_param('~fence_hard_size', 8.0)
+        self._fence_alt    = rospy.get_param('~fence_max_alt',   4.0)
+        self._upset_angle  = rospy.get_param('~upset_angle',     1.05)
+        self._settle_time  = rospy.get_param('~settle_time',     1.5)
+        self._start_x      = rospy.get_param('~start_x',         0.0)
+        self._start_y      = rospy.get_param('~start_y',         0.0)
+        self._max_crew     = int(rospy.get_param('~max_crew',      3))
+        self._join_deadline = rospy.get_param('~join_deadline',  0.7)
+        self._claim_to     = rospy.get_param('~claim_timeout',   3.0)
+        # Hand the *choosing* to somebody else and keep only the flying.
+        # The spotter still tasks this aircraft the same way; what stops
+        # is this node bidding for itself, so an external allocator can
+        # claim on its behalf without racing it.
+        self._external     = bool(rospy.get_param('~external_tasking', False))
+        self._target_to    = rospy.get_param('~target_timeout',  2.0)
+        choose_hz          = rospy.get_param('~choose_hz',       2.0)
+        control_hz         = rospy.get_param('~control_hz',     20.0)
+        status_hz          = rospy.get_param('~status_hz',       2.0)
+
+        self._x = self._y = self._z = 0.0
+        self._roll = self._pitch = self._yaw = 0.0
+        self._odom_ready = False
+        self._rescues = 0
+        self._settle_until = rospy.Time(0)
+
+        self._scan = None
+        self._scan_at = rospy.Time(0)
+        self._avoiding = False
+        self._avoid_until = rospy.Time(0)
+        self._fenced = False
+
+        self._fire = None
+        self._state = 'TAKEOFF'
+        self._wait_ticks = 0
+        self._score = 0.0
+        self._drops = 0
+        self._history = []
+
+        # The board, and this drone's position in the market for it.
+        self._board = []
+        self._board_stamp = rospy.Time(0)
+        self._pending = None            # fire id claimed but not yet confirmed
+        self._pending_since = rospy.Time(0)
+        self._last_target = rospy.Time(0)
+        self._peer_claims = {}          # other drone -> (fire id, when)
+
+        rospy.Subscriber('ground_truth/state', Odometry, self._odom_cb)
+        rospy.Subscriber('bushfire/target', Hotspot, self._target_cb)
+        rospy.Subscriber('/bushfire/hotspots', HotspotArray, self._board_cb)
+        rospy.Subscriber('/bushfire/claims', FireClaim, self._peer_claim_cb)
+
+        # Where the other aircraft actually are. See _peer_filter for why the
+        # laser cannot answer this.
+        self._peer_pose = {}
+        for peer in rospy.get_param('~peers', []):
+            if peer == self._ns:
+                continue
+            rospy.Subscriber('/%s/ground_truth/state' % peer, Odometry,
+                             self._peer_pose_cb, peer, queue_size=1)
+        rospy.Subscriber('scan', LaserScan, self._scan_cb)
+
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self._claim_pub = rospy.Publisher('/bushfire/claims', FireClaim,
+                                          queue_size=10)
+
+        # Held open rather than looked up per call: a rescue is the one moment
+        # this node is in a hurry, and it needs all three of these.
+        self._engage_srv = None
+        self._shutdown_srv = None
+        self._set_state_srv = None
+        self._connect_services()
+
+        self._engage()
+
+        rospy.Timer(rospy.Duration(1.0 / control_hz), self._control_loop)
+        rospy.Timer(rospy.Duration(1.0 / choose_hz), self._market_loop)
+        rospy.Timer(rospy.Duration(1.0 / status_hz), self._status_display)
+
+        self._print_header()
+
+    # ------------------------------------------------------------ motors ---
+    def _connect_services(self):
+        try:
+            rospy.wait_for_service('engage', timeout=60.0)
+            rospy.wait_for_service('shutdown', timeout=10.0)
+            rospy.wait_for_service('/gazebo/set_model_state', timeout=10.0)
+        except rospy.ROSException as exc:
+            rospy.logerr('[%s] services never appeared: %s', self._ns, exc)
+            return
+        self._engage_srv    = rospy.ServiceProxy('engage', Empty)
+        self._shutdown_srv  = rospy.ServiceProxy('shutdown', Empty)
+        self._set_state_srv = rospy.ServiceProxy('/gazebo/set_model_state',
+                                                 SetModelState)
+
+    def _engage(self):
+        """Spin the motors up.
+
+        The launch turns hector's auto_engage off. Left on it engages on the
+        first commanded climb and, more to the point, cuts the motors when it
+        sees a commanded descent it cannot achieve. That is landing detection,
+        and DESCEND is indistinguishable from a landing by design: a commanded
+        descent onto the ground, held at drop_altitude for as long as it takes
+        the spotter to register the drop.
+        """
+        if self._engage_srv is None:
+            return
+        try:
+            self._engage_srv()
+            rospy.loginfo('[%s] motors engaged', self._ns)
+        except rospy.ServiceException as exc:
+            rospy.logerr('[%s] could not engage motors: %s', self._ns, exc)
+
+    def _shutdown_motors(self):
+        """Cut the motors, which is the only thing that resets the PIDs.
+
+        See "Geofence and rescue" above: with auto_engage off, TwistController
+        never takes the branch that calls reset(), so this is the sole way to
+        empty its integrators.
+        """
+        if self._shutdown_srv is None:
+            return
+        try:
+            self._shutdown_srv()
+        except rospy.ServiceException as exc:
+            rospy.logwarn('[%s] could not shut motors down: %s', self._ns, exc)
+
+    # ------------------------------------------------------------- fence ---
+    def _lost(self):
+        """True if the aircraft is beyond saving by ordinary control."""
+        return (abs(self._x) > self._fence_hard or
+                abs(self._y) > self._fence_hard or
+                self._z > self._fence_alt or
+                abs(self._roll) > self._upset_angle or
+                abs(self._pitch) > self._upset_angle)
+
+    def _outside_fence(self):
+        return abs(self._x) > self._fence or abs(self._y) > self._fence
+
+    def _rescue(self):
+        """Teleport back to the launch point, stopped and level, and re-engage.
+
+        Order matters. The motors go off *first*: that is what empties the
+        attitude PIDs, and a teleport without it hands the freshly-levelled
+        aircraft the integral the controller had wound up fighting the tumble.
+        """
+        self._rescues += 1
+        rospy.logwarn('[%s] RESCUE #%d - lost at (%.1f, %.1f, %.1f) '
+                      'roll=%.0f pitch=%.0f deg; respawning at (%.1f, %.1f)',
+                      self._ns, self._rescues, self._x, self._y, self._z,
+                      math.degrees(self._roll), math.degrees(self._pitch),
+                      self._start_x, self._start_y)
+
+        self._publish(Twist())
+        self._shutdown_motors()
+
+        # Give the fire up on the way past. The commitment rule exists so that
+        # a crew can count on its members, and an aircraft about to be
+        # teleported to its launch point is exactly the case where they cannot:
+        # it would keep its share while contributing nothing and hold a station
+        # its crewmates could have used. Releasing is the honest version of the
+        # spotter's timeout, taken by the node that already knows.
+        self._release_claim('rescued')
+
+        state = ModelState()
+        state.model_name = self._ns
+        state.reference_frame = 'world'
+        state.pose.position.x = self._start_x
+        state.pose.position.y = self._start_y
+        state.pose.position.z = 0.3
+        state.pose.orientation.w = 1.0
+        if self._set_state_srv is None:
+            rospy.logerr('[%s] respawn unavailable - no set_model_state',
+                         self._ns)
+            return
+        try:
+            self._set_state_srv(state)
+        except rospy.ServiceException as exc:
+            rospy.logerr('[%s] respawn failed: %s', self._ns, exc)
+            return
+
+        # Let the teleport settle before commanding anything, or the first
+        # command is computed against the pose it had before it moved. The
+        # motors are off through this, so nothing is being flown.
+        rospy.sleep(0.5)
+        self._publish(Twist())
+        self._engage()
+        self._state = 'TAKEOFF'
+        self._avoiding = False
+
+        # Landing gear bounce is not an upset. Without this hold the next tick
+        # sees the attitude of a drone still settling on its feet and rescues
+        # it again, which is how a single bad moment became 53 of them.
+        self._settle_until = rospy.Time.now() + rospy.Duration(self._settle_time)
+
+    # ------------------------------------------------------ laser helpers ---
+    def _sector_min(self, deg_from, deg_to):
+        """Minimum valid range in an angular sector, degrees, 0 = forward.
+
+        The scan is 270 degrees centred on forward, not the TurtleBot3's full
+        360, so index-to-angle uses angle_min and angle_increment from the
+        message rather than tb3_treasure's `i * 360 / n`. That shortcut is only
+        correct for a scanner that closes the circle, and using it here would
+        silently rotate every sector by 45 degrees.
+
+        The floor is normally just the sensor's own, so a wall the drone is
+        already touching is still a wall. It rises to self_hit_range only while
+        the aircraft is tilted past the angle at which the mast stops clearing
+        the rotors - see "Self-hits" at the top of this file.
+        """
+        scan = self._scan
+        if scan is None:
+            return float('inf')
+
+        floor = max(scan.range_min, self._min_range)
+        if max(abs(self._roll), abs(self._pitch)) > self._self_hit_tilt:
+            floor = max(floor, self._self_hit)
+        a = deg_from % 360.0
+        b = deg_to % 360.0
+        best = float('inf')
+        for i, r in enumerate(scan.ranges):
+            if not math.isfinite(r) or not (floor < r < scan.range_max):
+                continue
+            deg = math.degrees(scan.angle_min + i * scan.angle_increment) % 360.0
+            in_sector = (a <= deg <= b) if a <= b else (deg >= a or deg <= b)
+            if in_sector and r < best:
+                best = r
+        return best
+
+    def _publish(self, cmd):
+        """The one place a velocity command leaves this node.
+
+        Everything goes through here, which is the point. The three-sector
+        filter only ever ran on CHASE; _lateral_filter and _peer_filter cover
+        more but still only the paths that call them. Every collision measured
+        in this package happened in a state whose command did not pass through
+        whichever guard would have caught it - so the guard that is meant to
+        hold "in any case" cannot live in a state. It has to sit at the exit.
+        """
+        # The lidar is the first gate because it is the sensor that observes
+        # physical trunks and aircraft at the current flight height.  The
+        # geometric governor remains after it to cover the scanner's rear
+        # blind wedge and vertical crossings between two aircraft.
+        self._cmd_pub.publish(self._govern(self._lidar_filter(cmd)))
+
+    def _lidar_filter(self, cmd):
+        """Fail safe before any horizontal command that lidar cannot clear.
+
+        CHASE has a richer three-sector steering policy in _safety_filter,
+        but commands from DESCEND, station keeping, and backing out also have
+        to be safe.  This filter examines the sector in the *actual commanded
+        direction*, so it covers forward and lateral motion alike.  It is
+        deliberately conservative: the Hokuyo has a 270 degree field of view,
+        therefore a command whose safety sector enters its rear blind wedge is
+        stopped rather than guessed at.  Yaw and vertical commands are left
+        available, allowing the controller to turn until lidar can see a safe
+        route again.
+
+        A missing or stale scan is treated identically.  Flying blind can turn
+        a dropped sensor message into a tree or drone collision.
+        """
+        vx, vy = cmd.linear.x, cmd.linear.y
+        speed = math.hypot(vx, vy)
+        if speed < 1e-6:
+            return cmd
+
+        scan = self._scan
+        now = rospy.Time.now()
+        if scan is None or (now - self._scan_at).to_sec() > self._scan_timeout:
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+            rospy.logwarn_throttle(2.0, '[%s] lidar stale - holding horizontal motion'
+                                   % self._ns)
+            return cmd
+
+        # Keep the full 25 degree safety sector inside the scan, rather than
+        # accepting a tiny sliver at either edge as evidence that the way is
+        # clear.  angle_min/max are used because these are properties of the
+        # actual scan, not assumptions about a particular Hokuyo model.
+        half = math.radians(25.0)
+        heading = math.atan2(vy, vx)
+        if (heading - half < scan.angle_min or
+                heading + half > scan.angle_max):
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+            return cmd
+
+        deg = math.degrees(heading)
+        nearest = self._sector_min(deg - 25.0, deg + 25.0)
+        if nearest <= self._stop_dist:
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+            return cmd
+        if nearest < self._avoid_dist:
+            span = max(self._avoid_dist - self._stop_dist, 1e-3)
+            scale = _clamp((nearest - self._stop_dist) / span, 0.0, 1.0)
+            cmd.linear.x *= scale
+            cmd.linear.y *= scale
+        return cmd
+
+    def _govern(self, cmd):
+        """Last-resort: never command a velocity that closes on something solid.
+
+        A reactive filter shapes speed and hopes. This asks a different and much
+        narrower question - *where would this command put the aircraft* - and
+        refuses the part of it that would end inside a trunk or another drone.
+
+        It works on the commanded velocity rotated into the world, projects the
+        aircraft forward by ~govern_lookahead seconds, and if that lands inside
+        an obstacle's hard radius it removes only the **closing component** of
+        the velocity, leaving anything tangential intact. So a drone flying past
+        a trunk keeps flying past it; a drone flying at one stops approaching
+        and can still slide around it.
+
+        Two properties matter more than the arithmetic.
+
+        It is applied to every published command, including the station-keeping
+        and descent commands that no other guard touches, because the exit is
+        the only place that covers every state.
+
+        And it never touches linear.z. Trees are 3 m and the aircraft works
+        between 0.95 and 2.6 m, so height is never the way out of a horizontal
+        conflict; blocking a descent because a trunk is 1 m away would strand a
+        drone over its own fire.
+        """
+        if not self._obstacles and not self._peer_pose:
+            return cmd
+        vx_b, vy_b = cmd.linear.x, cmd.linear.y
+        if abs(vx_b) < 1e-6 and abs(vy_b) < 1e-6:
+            return cmd
+
+        # Body -> world.
+        c, s_ = math.cos(self._yaw), math.sin(self._yaw)
+        vx = vx_b * c - vy_b * s_
+        vy = vx_b * s_ + vy_b * c
+
+        t = self._govern_dt
+        px, py = self._x + vx * t, self._y + vy * t
+
+        for ox, oy, orad, hard in self._solids(cmd.linear.z):
+            # Only if the *predicted* point breaches it. Judging on the current
+            # position instead would have the aircraft frozen the moment it got
+            # close, however it was moving - including while leaving.
+            if math.hypot(px - ox, py - oy) >= hard:
+                continue
+            dx, dy = ox - self._x, oy - self._y
+            d = math.hypot(dx, dy)
+            if d < 1e-6:
+                continue
+            ux, uy = dx / d, dy / d
+            closing = vx * ux + vy * uy
+            if closing <= 0.0:
+                continue                    # already moving away
+            vx -= closing * ux
+            vy -= closing * uy
+
+        # World -> body.
+        cmd.linear.x = vx * c + vy * s_
+        cmd.linear.y = -vx * s_ + vy * c
+        return cmd
+
+    def _solids(self, vz=0.0):
+        """Everything with a hard radius: the trunks, and the other aircraft.
+
+        Peers only while they overlap vertically - two aircraft 0.45 m apart on
+        different lanes cannot touch however their paths cross, and treating
+        that as a conflict would stop every transit that passes under another.
+
+        But the test is on the vertical separation **now or after the
+        lookahead, whichever is smaller**, and that second half is not
+        decoration. Gating on the present separation alone leaves a blind spot
+        exactly where the collisions were: a drone descending onto a fire
+        passes through the altitude of one already there, and while it is still
+        more than ~peer_vsep above, that peer is invisible to this check. By
+        the time the gate opens the two are already inside the horizontal
+        radius, and a governor that only removes *closing* velocity cannot
+        recover a separation that was lost while it was not looking. Measured
+        that way: contacts at 0.40-0.70 m horizontal, every one of them with
+        0.29-0.30 m of vertical separation.
+        """
+        out = []
+        for o in self._obstacles:
+            out.append((o[0], o[1], o[2],
+                        o[2] + self._rotor + self._hard_margin))
+        z_soon = self._z + vz * self._govern_dt
+        for _, (ox, oy, oz) in self._peer_pose.items():
+            if min(abs(self._z - oz), abs(z_soon - oz)) > self._peer_vsep:
+                continue
+            out.append((ox, oy, self._rotor,
+                        2.0 * self._rotor + self._hard_margin))
+        return out
+
+    def _peer_filter(self, cmd):
+        """Push away from another aircraft that is too close.
+
+        The laser cannot answer this on its own. It is a horizontal plane on a
+        mast, so it sees another drone beautifully when the two are at the same
+        height and not at all when one is above or below - and that is exactly
+        the geometry of the encounters that matter: one aircraft descending
+        onto a fire while another crosses over the top of it, or two climbing
+        away from the same fire into the same piece of sky. Between the cruise
+        altitude and the drop altitude there is a metre of height in which two
+        drones are mutually invisible.
+
+        So separation is done from known positions instead, for the same reason
+        the spotter is told where the trees are rather than asked to find them.
+
+        Only when the two overlap vertically: aircraft at clearly different
+        heights pass over each other constantly and by design, and treating
+        that as a conflict would have every transit fighting the one above it.
+
+        The push is added to the body-frame command rather than replacing it,
+        so the drone keeps doing its job while being nudged clear, and is capped
+        at ~peer_push so it can never overpower the station-keeping and throw an
+        aircraft off the fire it is bombing.
+        """
+        if not self._peer_pose:
+            return cmd
+        px = py = 0.0
+        for _, (ox, oy, oz) in self._peer_pose.items():
+            if abs(self._z - oz) > self._peer_vsep:
+                continue
+            dx, dy = self._x - ox, self._y - oy
+            d = math.hypot(dx, dy)
+            if d >= self._peer_radius or d < 1e-3:
+                continue
+            # Linear ramp: nothing at the edge of the bubble, full push at
+            # contact. Summed over peers so the middle aircraft of three is
+            # pushed out of the pair rather than towards one of them.
+            w = (self._peer_radius - d) / self._peer_radius
+            px += (dx / d) * w
+            py += (dy / d) * w
+
+        if px == 0.0 and py == 0.0:
+            return cmd
+        mag = math.hypot(px, py)
+        if mag > 1.0:
+            px, py = px / mag, py / mag
+        c, s_ = math.cos(self._yaw), math.sin(self._yaw)
+        bx = px * c + py * s_
+        by = -px * s_ + py * c
+        cmd.linear.x = _clamp(cmd.linear.x + self._peer_push * bx,
+                              -self._lin_speed, self._lin_speed)
+        cmd.linear.y = _clamp(cmd.linear.y + self._peer_push * by,
+                              -self._lin_speed, self._lin_speed)
+        return cmd
+
+    def _lateral_filter(self, cmd):
+        """Stop the aircraft strafing into something it can see.
+
+        The three-sector filter below shapes forward speed and yaw and nothing
+        else, which was fine while it only ran on CHASE. But DESCEND and the
+        station-keeping over a fire command **linear.y**, and a sideways
+        command is invisible to a filter that only scales linear.x. A drone
+        holding station beside a trunk drifts laterally into it with the
+        avoidance engaged the whole time and structurally unable to help.
+
+        So lateral commands are damped against the side sectors, on the same
+        taper the forward channel uses. +y is left in the body frame.
+
+        Deliberately outside the front-sector early return below: an aircraft
+        beside a trunk has nothing in front of it, so that branch would return
+        the command untouched exactly when this is needed.
+        """
+        left = self._sector_min(10.0, 80.0)
+        right = self._sector_min(280.0, 350.0)
+        span = max(self._avoid_dist - self._stop_dist, 1e-3)
+
+        if cmd.linear.y > 0.0 and left < self._avoid_dist:
+            cmd.linear.y *= _clamp((left - self._stop_dist) / span, 0.0, 1.0)
+        elif cmd.linear.y < 0.0 and right < self._avoid_dist:
+            cmd.linear.y *= _clamp((right - self._stop_dist) / span, 0.0, 1.0)
+        return cmd
+
+    def _safety_filter(self, cmd):
+        """Reactive obstacle avoidance, applied to CHASE commands.
+
+        Same three-sector logic as tb3_treasure - front +-45, left 10-80,
+        right 280-350 - and, like tb3_treasure's, it works directly on
+        cmd.linear.x, because /cmd_vel here is body-frame too. Vertical
+        velocity is left alone: the laser has nothing to say about it.
+
+        Lateral velocity and peer separation are handled by _lateral_filter and
+        _peer_filter, which run first and unconditionally - see there for why
+        neither can live inside the front sector's early return.
+        """
+        cmd = self._peer_filter(self._lateral_filter(cmd))
+        front = self._sector_min(315.0, 45.0)
+
+        if front > self._avoid_dist:
+            self._avoiding = False
+            return cmd
+
+        self._avoiding = True
+        self._avoid_until = rospy.Time.now() + rospy.Duration(self._avoid_hold)
+        left = self._sector_min(10.0, 80.0)
+        right = self._sector_min(280.0, 350.0)
+        turn_left = left >= right
+
+        if front <= self._stop_dist:
+            # Stop, back away, and yaw toward the clearer side.
+            #
+            # tb3_treasure only stops and spins, which works for a robot that
+            # can pivot on the spot and then drive out along a new heading.
+            # This one cannot always: caught against a wall it spins, and every
+            # heading it turns to still has the wall in front, so it spins for
+            # the rest of the run. Observed exactly that - all three drones
+            # pinned to walls at max yaw rate, scoring nothing. Reversing is
+            # what actually breaks the deadlock, and it is free here because a
+            # multirotor has no preferred direction of travel.
+            cmd.linear.x = -self._back_off
+            cmd.linear.y = 0.0
+            cmd.angular.z = self._max_ang if turn_left else -self._max_ang
+        else:
+            ratio = ((front - self._stop_dist) /
+                     (self._avoid_dist - self._stop_dist))
+            cmd.linear.x *= ratio
+
+            avoid_w = self._max_ang * (1.0 - ratio)
+            if turn_left:
+                cmd.angular.z = min(self._max_ang, cmd.angular.z + avoid_w)
+            else:
+                cmd.angular.z = max(-self._max_ang, cmd.angular.z - avoid_w)
+
+        return cmd
+
+    # ------------------------------------------------------------ market ---
+    def _release_claim(self, why):
+        """Tell the spotter this drone is no longer on its fire."""
+        fire_id = (self._fire.id if self._fire is not None else self._pending)
+        if fire_id is None:
+            return
+        claim = FireClaim()
+        claim.drone = self._ns
+        claim.fire_id = fire_id
+        claim.release = True
+        self._claim_pub.publish(claim)
+        rospy.logwarn('[%s] releasing fire %d - %s', self._ns, fire_id, why)
+        self._fire = None
+        self._pending = None
+
+    def _station(self):
+        """Where to fly to: this drone's slot, not the fire itself.
+
+        The spotter owns the geometry, because it is the only node that knows
+        how many drones are on the fire and in what order they joined. A zeroed
+        station - an older spotter, or a message built by hand - falls back to
+        the fire, which is also what a lone drone's station is anyway.
+        """
+        f = self._fire
+        if f.station_x == 0.0 and f.station_y == 0.0:
+            return f.x, f.y
+        return f.station_x, f.station_y
+
+    def _station_alt(self):
+        """Bombing height for this drone's slot in the crew.
+
+        Crews are stacked vertically as well as spread over a ring, so this is
+        not the same for every member. ~drop_altitude remains the fallback and
+        is what member 0 gets.
+        """
+        f = self._fire
+        return f.station_z if f.station_z > 0.0 else self._drop_alt
+
+    def _crew_of(self, hot):
+        """Drones on that fire, counting the ones the board has not seen yet.
+
+        A claim published after the board was stamped cannot be in it, so the
+        two sources add without double-counting: the board carries every claim
+        the spotter had accepted by header.stamp, and _peer_claims carries the
+        rest. Claims older than the board are already in `hot.crew` and are
+        skipped by the same test, which is also how they expire.
+        """
+        pending = sum(1 for fire_id, when in self._peer_claims.values()
+                      if fire_id == hot.id and when > self._board_stamp)
+        return hot.crew + pending
+
+    def _utility(self, hot):
+        """Share per second if this drone joined that fire, or None to skip.
+
+        n is crew+1 because the drone is asking what its own arrival would be
+        worth, not what the fire is worth now. Both places n appears matter:
+
+          intensity / n     the payout, split equally with everyone who chose
+                            it - so joining is a cost.
+          work_left / n     the time, because every drone on station does a
+                            second of work per second - so joining is also a
+                            saving, and on a big fire the saving is bigger.
+
+        Travel is charged at cruise speed and straight-line distance, which is
+        optimistic around trees; it does not need to be right, only consistent
+        between the fires being compared.
+
+        Two fires are not worth bidding on at all. One whose crew is full, and
+        one that is nearly out: `work_left / n` goes to nothing as a job
+        finishes, so a fire at 95% is the highest-utility thing on the board by
+        a distance, and joining it pays a full share for arriving after it is
+        over. Measured: a drone that had bombed a 7 alone for fourteen seconds
+        was joined at 0.3 drone-seconds remaining by both others and kept 2.33
+        of it. ~join_deadline closes a crew that is already most of the way
+        through, and the spotter enforces the same line.
+        """
+        crew = self._crew_of(hot)
+        if crew >= self._max_crew:
+            return None
+        if crew > 0 and hot.work_total > 0.0:
+            if hot.work_done / hot.work_total > self._join_deadline:
+                return None
+        n = crew + 1
+        share = hot.intensity / float(n)
+        work_left = max(0.0, hot.work_total - hot.work_done)
+        travel = (math.hypot(hot.x - self._x, hot.y - self._y) /
+                  max(self._lin_speed, 0.1))
+        return share / max(travel + work_left / float(n), 0.1)
+
+    def _choose(self):
+        """Best fire on the board, or None if there is nothing to bid on."""
+        best = None
+        best_u = 0.0
+        for hot in self._board:
+            u = self._utility(hot)
+            if u is not None and u > best_u:
+                best, best_u = hot, u
+        return best, best_u
+
+    def _market_loop(self, _event):
+        """Pick a fire, claim it, and keep claiming until it is confirmed.
+
+        Only ever runs when the drone owes nobody anything. The one thing it
+        does while committed is notice that it has *stopped* being committed:
+        taskings arrive at the spotter's tick rate, so silence means the
+        commitment was dropped at the other end - the only way that happens is
+        the spotter's not-turning-up timeout, and the drone would otherwise
+        fly at a fire nobody thinks is its any more.
+        """
+        if not self._odom_ready or self._state == 'TAKEOFF':
+            return
+        now = rospy.Time.now()
+
+        if self._fire is not None:
+            if (now - self._last_target).to_sec() > self._target_to:
+                rospy.logwarn('[%s] no tasking for %.1f s - assuming fire %d '
+                              'was taken back', self._ns, self._target_to,
+                              self._fire.id)
+                self._fire = None
+                self._pending = None
+                self._state = 'CLIMB'
+            return
+
+        if self._external:
+            return          # an external allocator does the choosing
+
+        # A claim can be refused - the crew filled up while the board was in
+        # flight - and nothing answers it directly. Re-sending covers that and
+        # a lost message with the same code; re-picking after the timeout
+        # covers the case where the refusal is permanent.
+        if (self._pending is not None and
+                (now - self._pending_since).to_sec() < self._claim_to):
+            self._send_claim(self._pending)
+            return
+
+        if not self._board:
+            return
+
+        hot, utility = self._choose()
+        if hot is None:
+            return
+
+        self._pending = hot.id
+        self._pending_since = now
+        self._send_claim(hot.id)
+        print('  [%s] %s[BID]%s fire %-2d worth %s%.0f%s, crew %d -> share '
+              '%.2f, %.1f drone-s left  (%.2f/s)'
+              % (self._ns, _CYAN, _RESET, hot.id, _YELLOW, hot.intensity,
+                 _RESET, hot.crew, hot.intensity / float(hot.crew + 1),
+                 max(0.0, hot.work_total - hot.work_done), utility))
+
+    def _send_claim(self, fire_id):
+        claim = FireClaim()
+        claim.drone = self._ns
+        claim.fire_id = fire_id
+        claim.release = False
+        self._claim_pub.publish(claim)
+
+    # ----------------------------------------------------------- display ---
+    def _print_header(self):
+        print()
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET)
+        print(_BOLD + _WHITE + '|   UAV FIRE SUPPRESSOR  -  %-22s |' % self._ns + _RESET)
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET)
+        print('  %scruise_alt%s   = %.2f m     %sdrop_altitude%s = %.2f m'
+              % (_CYAN, _RESET, self._cruise_alt, _CYAN, _RESET, self._drop_alt))
+        print('  %sarrive_rad%s   = %.2f m     %slinear_speed%s  = %.2f m/s'
+              % (_CYAN, _RESET, self._arrive_rad, _CYAN, _RESET, self._lin_speed))
+        print('  %savoid_dist%s   = %.2f m     %sstop_dist%s     = %.2f m'
+              % (_CYAN, _RESET, self._avoid_dist, _CYAN, _RESET, self._stop_dist))
+        print()
+
+    def _print_drop(self, drop, fire):
+        print(_BOLD + _GREEN + '+--------------------------------------------------+' + _RESET)
+        print(_BOLD + _GREEN + '|  *** FIRE SUPPRESSED  %-6s  (job #%4d) ***   |'
+              % (self._ns, drop) + _RESET)
+        print(_BOLD + _GREEN + '+--------------------------------------------------+' + _RESET)
+        print('  Fire value       : %s%s%5.0f%s  [%s]'
+              % (_YELLOW, _BOLD, fire.intensity, _RESET, _bar(fire.intensity)))
+        print('  Crew             : %d drone(s), %.1f drone-s of work'
+              % (fire.crew, fire.work_total))
+        print('  This drone\'s cut : %s%s%5.2f%s  (%.0f / %d)'
+              % (_YELLOW, _BOLD, fire.reward, _RESET,
+                 fire.intensity, max(fire.crew, 1)))
+        print('  Total score      : %s%s%7.2f%s' % (_YELLOW, _BOLD, self._score, _RESET))
+        print('  Fire (id %-3d)    : (%6.2f, %6.2f) on the ground'
+              % (fire.id, fire.x, fire.y))
+        print('  Dropped from     : (%6.2f, %6.2f, %5.2f) m'
+              % (self._x, self._y, self._z))
+        print()
+        if len(self._history) > 1:
+            print('  Recent jobs:')
+            for d, v, t in self._history[-5:]:
+                marker = _GREEN + '>>>' + _RESET if d == drop else '   '
+                print('    %s Job #%-3d +%-5.2f => total %.2f' % (marker, d, v, t))
+            print()
+
+    def _status_display(self, _event):
+        if not self._odom_ready:
+            return
+        state_col = {'ALIGN': _CYAN, 'CHASE': _GREEN, 'DESCEND': _YELLOW,
+                     'CLIMB': _CYAN, 'WAIT': _YELLOW,
+                     'TAKEOFF': _WHITE}.get(self._state, _WHITE)
+
+        if self._fire is None:
+            print('  [%s] [%s%-7s%s] pos=(%6.2f,%6.2f,%5.2f) %s '
+                  'score=%s%s%7.2f%s jobs=%d'
+                  % (self._ns, state_col, self._state, _RESET,
+                     self._x, self._y, self._z,
+                     'bidding on fire %d' % self._pending if self._pending
+                     is not None else 'unassigned',
+                     _YELLOW, _BOLD, self._score, _RESET, self._drops))
+            return
+
+        f = self._fire
+        tx, ty = self._station()
+        dist_xy = math.hypot(tx - self._x, ty - self._y)
+        avoid_tag = ' %s[AVOID]%s' % (_RED, _RESET) if self._avoiding else ''
+        # The fence replaces the target, so say so - otherwise the status line
+        # shows a fire the drone has temporarily stopped flying toward.
+        if self._fenced:
+            avoid_tag += ' %s[FENCE]%s' % (_RED, _RESET)
+        done = (100.0 * f.work_done / f.work_total) if f.work_total > 0 else 0.0
+        print('  [%s] [%s%-7s%s]%s pos=(%6.2f,%6.2f,%5.2f) '
+              'fire%-2d=(%5.2f,%5.2f) dist=%s%5.2f%s crew=%d cut=%.2f '
+              'work=%3.0f%% score=%s%s%7.2f%s jobs=%d'
+              % (self._ns, state_col, self._state, _RESET, avoid_tag,
+                 self._x, self._y, self._z, f.id, f.x, f.y,
+                 _CYAN, dist_xy, _RESET, f.crew, f.share, done,
+                 _YELLOW, _BOLD, self._score, _RESET, self._drops))
+
+    # --------------------------------------------------------- callbacks ---
+    def _odom_cb(self, msg):
+        self._x = msg.pose.pose.position.x
+        self._y = msg.pose.pose.position.y
+        self._z = msg.pose.pose.position.z
+        q = msg.pose.pose.orientation
+        self._roll, self._pitch, self._yaw = euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])
+        self._odom_ready = True
+
+    def _scan_cb(self, msg):
+        self._scan = msg
+        self._scan_at = rospy.Time.now()
+
+    def _board_cb(self, msg):
+        self._board = msg.hotspots
+        self._board_stamp = msg.header.stamp
+
+    def _peer_pose_cb(self, msg, peer):
+        p = msg.pose.pose.position
+        self._peer_pose[peer] = (p.x, p.y, p.z)
+
+    def _peer_claim_cb(self, msg):
+        """Somebody else's choice, heard on the shared claim topic.
+
+        The board is a tenth of a second old and the whole fleet decides at the
+        same time, so without this a drone is bidding against a picture in
+        which nobody else has moved. Measured on the first run of this: the
+        three aircraft chose within 30 ms of each other, every one of them read
+        crew=0, and all three went to the same fire every single time - twice
+        onto fires small enough that a crew of three was the worst available
+        option for all of them. Nothing was wrong with the arithmetic; it was
+        being fed a board that had not heard the other two yet.
+        """
+        if msg.drone == self._ns:
+            return
+        if msg.release:
+            self._peer_claims.pop(msg.drone, None)
+            return
+        self._peer_claims[msg.drone] = (msg.fire_id, rospy.Time.now())
+
+    def _target_cb(self, msg):
+        """The spotter confirming this drone's job, or closing it out.
+
+        This arrives at the spotter's tick rate for as long as the commitment
+        stands, which makes it two things at once: the current station, crew
+        size and work counter, and the heartbeat that _market_loop reads as
+        proof the drone still holds the fire.
+
+        Most of these change nothing. The message that does is the first one
+        for a fire the drone was not already working - a claim being accepted -
+        and the response is ALIGN, because the heading it was flying belongs to
+        wherever it was before.
+
+        States that ignore even that: DESCEND, because the station moving under
+        a crew change is a station-keeping problem rather than a reason to
+        stop bombing and yaw; and CLIMB/TAKEOFF, which have to finish getting
+        the aircraft to a sane altitude first and hand over to ALIGN
+        themselves.
+        """
+        prev = self._fire
+        self._last_target = rospy.Time.now()
+
+        if msg.suppressed:
+            # The fire is out and the value has been split. reward is this
+            # drone's share, not the fire's value: on a crew of three a 9 pays
+            # 3 here and 3 to each of the others.
+            self._score += msg.reward
+            self._drops += 1
+            self._history.append((self._drops, msg.reward, self._score))
+            self._print_drop(self._drops, msg)
+            self._fire = None
+            self._pending = None
+            self._state = 'CLIMB'
+            return
+
+        self._fire = msg
+        if self._pending == msg.id:
+            self._pending = None
+
+        if prev is not None and prev.id == msg.id:
+            return
+        if self._state in ('WAIT', 'TAKEOFF', 'DESCEND', 'CLIMB'):
+            return
+
+        print('  [%s] %s[ON FIRE %d]%s at (%.2f, %.2f) worth %s%.0f%s, crew of '
+              '%d -> %.2f each, %.1f drone-s left'
+              % (self._ns, _CYAN, msg.id, _RESET, msg.x, msg.y,
+                 _YELLOW, msg.intensity, _RESET, msg.crew, msg.share,
+                 max(0.0, msg.work_total - msg.work_done)))
+        self._state = 'ALIGN'
+
+    # -------------------------------------------------------- control loop --
+    def _control_loop(self, _event):
+        if not self._odom_ready:
+            return
+
+        cmd = Twist()
+
+        # Lost aircraft first, before any state does anything with it. There
+        # is no command that helps here - see "Geofence and rescue" above.
+        # Except just after a respawn, when the attitude being read is a drone
+        # bouncing on its landing gear rather than one in trouble.
+        if rospy.Time.now() < self._settle_until:
+            self._publish(cmd)
+            return
+
+        if self._lost():
+            self._rescue()
+            return
+
+        # TAKEOFF ---------------------------------------------------------
+        if self._state == 'TAKEOFF':
+            error = self._cruise_alt - self._z
+            if abs(error) < 0.15:
+                self._state = 'WAIT'
+                self._wait_ticks = 2
+                rospy.loginfo('[%s] airborne at %.2f m - on task', self._ns, self._z)
+            cmd.linear.z = _clamp(1.0 * error, -self._vert_speed, self._vert_speed)
+            self._publish(cmd)
+            return
+
+        if self._fire is None:
+            # Airborne with no tasking yet, or between a drop and the next
+            # assignment. Hold cruise altitude rather than publishing an empty
+            # Twist, which commands zero velocity and lets the drone sink.
+            cmd.linear.z = _clamp(1.0 * (self._cruise_alt - self._z),
+                                  -self._vert_speed, self._vert_speed)
+            self._publish(cmd)
+            return
+
+        # CLIMB -----------------------------------------------------------
+        # Get back up before flying anywhere. Checked before the geofence and
+        # before any horizontal command is built, because the whole point is
+        # that nothing else happens until the aircraft has its height back.
+        if self._state == 'CLIMB':
+            error = self._cruise_alt - self._z
+            cmd.linear.z = _clamp(1.0 * error, -self._vert_speed, self._vert_speed)
+            if abs(error) <= self._climb_tol:
+                self._state = 'ALIGN'
+            self._publish(cmd)
+            return
+
+        # Soft geofence. Outside it, the middle of the arena becomes the
+        # target and the fire waits - a drone drifting toward the wall it is
+        # about to be upset by should not still be working a fire.
+        if self._outside_fence():
+            tx, ty = 0.0, 0.0
+            self._fenced = True
+            rospy.logwarn_throttle(
+                5.0, '[%s] outside the fence at (%.1f, %.1f) - returning'
+                % (self._ns, self._x, self._y))
+        else:
+            self._fenced = False
+            tx, ty = self._station()
+
+        dx = tx - self._x
+        dy = ty - self._y
+        dist_xy = math.hypot(dx, dy)
+
+        # Altitude is driven in every flying state, because it is independent
+        # of heading and there is no reason to give up height while turning.
+        # Cruise everywhere except DESCEND, which overrides this below - the
+        # target is on the ground now, so there is no per-target altitude to
+        # track on the way there the way there was with floating treasure.
+        cmd.linear.z = _clamp(1.0 * (self._cruise_alt - self._z),
+                              -self._vert_speed, self._vert_speed)
+
+        # WAIT ------------------------------------------------------------
+        if self._state == 'WAIT':
+            self._wait_ticks -= 1
+            if self._wait_ticks <= 0:
+                self._state = 'ALIGN'
+            self._publish(cmd)
+            return
+
+        # DESCEND ---------------------------------------------------------
+        # On station over the fire: hold it and come down. Entered from CHASE,
+        # and left only by the spotter confirming the fire is out (which sends
+        # this node to CLIMB) or by the drone drifting back outside the arrival
+        # radius.
+        #
+        # This is where the work is done and it is no longer brief. A fire is
+        # put out by drone-seconds, so a 10 with nobody else on it holds the
+        # aircraft here for twelve of them - which is the cost the market
+        # arithmetic in _utility is weighing a smaller share against.
+        if self._state == 'DESCEND' or (self._state == 'CHASE' and
+                                        not self._fenced and
+                                        dist_xy <= self._arrive_rad):
+            if self._state != 'DESCEND':
+                self._state = 'DESCEND'
+            if dist_xy > 2.0 * self._arrive_rad:
+                # Blown off the fire. Climbing first rather than chasing at
+                # drop height keeps the transit rules honest.
+                self._state = 'CLIMB'
+                self._publish(cmd)
+                return
+
+            target_z = max(self._station_alt(), self._min_alt)
+            cmd.linear.z = _clamp(1.0 * (target_z - self._z),
+                                  -self._vert_speed, self._vert_speed)
+
+            # Station-keeping, in the body frame. The world-frame error is
+            # rotated by yaw because /cmd_vel is body-stabilized; this is the
+            # one phase that commands lateral velocity, and it is safe here
+            # only because the drone is stopped over an assigned fire that the
+            # spotter placed clear of the trees.
+            bx = dx * math.cos(self._yaw) + dy * math.sin(self._yaw)
+            by = -dx * math.sin(self._yaw) + dy * math.cos(self._yaw)
+            cmd.linear.x = _clamp(self._stn_gain * bx,
+                                  -self._stn_speed, self._stn_speed)
+            cmd.linear.y = _clamp(self._stn_gain * by,
+                                  -self._stn_speed, self._stn_speed)
+            # Lateral and peer only, not the full three-sector filter. The
+            # whole filter would back the aircraft off and yaw it away from the
+            # very fire it is descending onto - the fire IS the goal here, and
+            # something 1.5 m ahead at station altitude is usually a crew mate
+            # on the ring, not an obstruction. What does need shaping is the
+            # strafe: this is the one command in the node that moves the
+            # aircraft sideways, and it was previously published raw.
+            self._publish(self._peer_filter(self._lateral_filter(cmd)))
+            return
+
+        target_angle = math.atan2(dy, dx)
+        angle_err = _normalize_angle(target_angle - self._yaw)
+
+        # ALIGN -----------------------------------------------------------
+        if self._state == 'ALIGN':
+            if abs(angle_err) <= self._angle_tol:
+                self._state = 'CHASE'
+            else:
+                cmd.angular.z = _clamp(self._ang_gain * angle_err,
+                                       -self._max_ang, self._max_ang)
+                self._publish(cmd)
+                return
+
+        # CHASE -----------------------------------------------------------
+        # Drop back to ALIGN if the heading has drifted badly - but not while
+        # avoiding, and not for avoid_hold afterwards. The safety filter yaws
+        # deliberately off-target, and tb3_treasure's unconditional version of
+        # this check would read that as drift, hand control to ALIGN, and turn
+        # straight back into the pillar the filter had just steered around.
+        #
+        # Suppressing it only while the filter is *currently* triggered is not
+        # enough, and the reason is that clearing the front sector is the one
+        # thing a successful deflection guarantees. The drone turns off the
+        # pillar, the sector clears, this check fires on the same tick, ALIGN
+        # takes over and yaws it straight back, and the pillar is in front
+        # again - now with no forward motion to show for it, because ALIGN does
+        # not translate. That is a livelock, not a wobble: a drone 2.5 m from
+        # its target ping-ponged ALIGN/CHASE for the last 90 seconds of a run
+        # and finished with two collections against another drone's twelve.
+        # The hold buys enough committed forward flight - about 0.9 m at cruise
+        # for every second of it - to actually pass the thing, which is a
+        # slightly longer lateral offset than a tree plus a rotor span.
+        if (abs(angle_err) > 2.0 * self._angle_tol and
+                rospy.Time.now() >= self._avoid_until):
+            self._state = 'ALIGN'
+            self._publish(cmd)
+            return
+
+        speed_factor = (max(0.3, dist_xy / self._slow_dist)
+                        if dist_xy < self._slow_dist else 1.0)
+
+        # Body-frame forward. hector rotates this by the current yaw itself -
+        # see "Which frame /cmd_vel is in" at the top of this file - so flying
+        # along the heading is what commanding x alone already means.
+        cmd.linear.x = self._lin_speed * speed_factor
+        cmd.linear.y = 0.0
+        cmd.angular.z = _clamp(self._ang_gain * angle_err,
+                               -self._max_ang, self._max_ang)
+
+        cmd = self._safety_filter(cmd)
+
+        self._publish(cmd)
+
+
+def main():
+    FireSuppressor()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

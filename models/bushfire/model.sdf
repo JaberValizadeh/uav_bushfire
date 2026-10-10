@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<!-- Placeholder: this directory is a material library, not a
+     spawnable model, but Gazebo wants an SDF beside the
+     model.config. -->
+<sdf version="1.6">
+  <model name="bushfire"><static>true</static><link name="link"/></model>
+</sdf>
